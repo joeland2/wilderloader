@@ -1,0 +1,11 @@
+# Bara det som står här får följa med till det publika repot.
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/Package.swift
+!/build.sh
+!/Sources/
+!/Resources/
+!/docs/
+.DS_Store
