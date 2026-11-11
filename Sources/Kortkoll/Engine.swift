@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import UniformTypeIdentifiers
 
 // Ren logik utan UI, så att den kan testas från terminalen (`Kortkoll --check <mapp>`).
@@ -83,7 +82,7 @@ func fitShoots(_ groups: [[Int]], to n: Int) -> [[Int]] {
 func dirURL(_ u: URL) -> URL { URL(fileURLWithPath: u.standardizedFileURL.path, isDirectory: true) }
 
 /// Mappar som NAS och system skapar själva. Inget ska landa där.
-private let systemFolders: Set<String> = ["#recycle", "#snapshot", "@eaDir", "$RECYCLE.BIN", "System Volume Information"]
+let systemFolders: Set<String> = ["#recycle", "#snapshot", "@eaDir", "$RECYCLE.BIN", "System Volume Information"]
 
 /// Synliga undermappar, i Finders ordning. Program och andra paket räknas inte som mappar.
 func subfolders(of dir: URL) -> [URL] {
@@ -97,37 +96,27 @@ func subfolders(of dir: URL) -> [URL] {
     .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
 }
 
-/// Monterade minneskort: flyttbara volymer med en DCIM-mapp.
+/// Mappar som kameror skapar i kortets rot.
+private let cardFolders = ["DCIM", "PRIVATE", "CONTENTS", "XDROOT", "BPAV", "AVCHD", "CLIPS001", "AVF_INFO"]
+
+/// Monterade minneskort: flyttbara volymer med en kameramapp, RED-rullar eller Blackmagic-klipp i roten.
+/// shortcut: ljudinspelare och andra kort utan kända spår väljs med Change…, tills vi vet hur de brukar se ut.
 func mountedCards() -> [URL] {
     let keys: [URLResourceKey] = [.volumeIsRemovableKey, .volumeIsEjectableKey]
     let vols = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
+    let fm = FileManager.default
     return vols.filter { url in
         let v = try? url.resourceValues(forKeys: Set(keys))
-        let removable = v?.volumeIsRemovable == true || v?.volumeIsEjectable == true
-        return removable && FileManager.default.fileExists(atPath: url.appendingPathComponent("DCIM").path)
+        guard v?.volumeIsRemovable == true || v?.volumeIsEjectable == true else { return false }
+        if cardFolders.contains(where: { fm.fileExists(atPath: url.appendingPathComponent($0).path) }) { return true }
+        return ((try? fm.contentsOfDirectory(atPath: url.path)) ?? []).contains {
+            let name = $0.lowercased()
+            return name.hasSuffix(".rdm") || name.hasSuffix(".braw")
+        }
     }
 }
 
-func listFiles(_ root: URL) -> [CardFile] {
-    let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
-    guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
-                                                 options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
-    let base = root.standardizedFileURL.path
-    var out: [CardFile] = []
-    for case let url as URL in e {
-        guard let v = try? url.resourceValues(forKeys: Set(keys)), v.isRegularFile == true, isMedia(url) else { continue }
-        let path = url.standardizedFileURL.path
-        let rel = path.hasPrefix(base + "/") ? String(path.dropFirst(base.count + 1)) : url.lastPathComponent
-        out.append(CardFile(url: url, rel: rel, size: Int64(v.fileSize ?? 0), date: v.contentModificationDate ?? Date()))
-    }
-    return out.sorted { $0.rel < $1.rel }
-}
-
-/// Bilder, video och ljud. Kamerans egna databasfiler (t.ex. PRIVATE/…/CONTENTS.B00) räknas inte.
-func isMedia(_ url: URL) -> Bool {
-    guard let t = UTType(filenameExtension: url.pathExtension) else { return false }
-    return t.conforms(to: .image) || t.conforms(to: .audiovisualContent)
-}
+func listFiles(_ root: URL) -> [CardFile] { cardContents(root).files }
 
 /// Slår upp filnamn i Spotlight, i omgångar. Returnerar namn -> sökvägar.
 // shortcut: hittar bara kopior med samma filnamn på indexerade diskar; omdöpta kopior räknas som saknade (säkert håll: de kopieras igen).
@@ -349,6 +338,7 @@ func buildIndex(_ d: Disk, progress: (Int) -> Void = { _ in }) throws -> Int {
     var mediaExt: [String: Bool] = [:]
     var lines = ""
     var n = 0
+    var parts = ""
     while let ent = fts_read(fts) {
         if Task.isCancelled { throw CancellationError() }
         let info = Int32(ent.pointee.fts_info)
@@ -363,6 +353,7 @@ func buildIndex(_ d: Disk, progress: (Int) -> Void = { _ in }) throws -> Int {
             continue
         }
         guard !name.hasPrefix("."), let dot = name.lastIndex(of: ".") else { continue }
+        if name.hasSuffix(partSuffix) { if !path.contains("\n") { parts += path + "\n" }; continue }
         let ext = name[name.index(after: dot)...].lowercased()
         if mediaExt[ext] == nil { mediaExt[ext] = isMedia(URL(fileURLWithPath: "x.\(ext)")) }
         guard mediaExt[ext] == true, path.hasPrefix(base + "/"), !path.contains("\n"), !path.contains("\t") else { continue }
@@ -382,7 +373,45 @@ func buildIndex(_ d: Disk, progress: (Int) -> Void = { _ in }) throws -> Int {
         })
     }
     try Data("# \(n)\n\(lines)".utf8).write(to: url, options: .atomic)
+    try Data(parts.utf8).write(to: partsURL(d), options: .atomic)
     return n
+}
+
+private let partSuffix = ".wilderloader-part"
+private func partsURL(_ d: Disk) -> URL { indexURL(d).deletingPathExtension().appendingPathExtension("parts") }
+
+/// Avbrutna kopior som senaste skanningen hittade på diskarna. De ligger kvar efter en krasch eller ett NAS-fel.
+/// Bara filer som inte ändrats på `minAge` sekunder, så att en kopia som pågår från en annan dator lämnas i fred.
+func leftoverParts(on disks: [Disk], minAge: TimeInterval = 3600) -> [URL] {
+    disks.flatMap { d -> [URL] in
+        guard let text = try? String(contentsOf: partsURL(d), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map { URL(fileURLWithPath: String($0)) }.filter { u in
+            guard u.lastPathComponent.hasSuffix(partSuffix),
+                  let v = try? u.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                  v.isRegularFile == true, let date = v.contentModificationDate else { return false }
+            return Date().timeIntervalSince(date) >= minAge
+        }
+    }
+}
+
+/// Delfiler ska hittas av skanningen men aldrig räknas som filer, och nya delfiler ska lämnas i fred.
+private func testLeftoverParts() {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("wl-parts-\(UUID().uuidString)")
+    try! fm.createDirectory(at: root, withIntermediateDirectories: true)
+    let d = Disk(key: "selftest-\(UUID().uuidString)", name: "Test", root: root)
+    defer {
+        for u in [root, indexURL(d), partsURL(d)] { try? fm.trashItem(at: u, resultingItemURL: nil) }
+    }
+    let part = root.appendingPathComponent("A.MOV.12345678\(partSuffix)")
+    try! Data(count: 10).write(to: part)
+    try! Data(count: 10).write(to: root.appendingPathComponent("B.JPG"))
+    assert(try! buildIndex(d) == 1, "en delfil ska inte räknas som en fil")
+    assert(leftoverParts(on: [d]).isEmpty, "en ny delfil kan vara en pågående kopia")
+    try! fm.setAttributes([.modificationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: part.path)
+    assert(leftoverParts(on: [d]).map(\.lastPathComponent) == [part.lastPathComponent], "en gammal delfil ska hittas")
+    try! fm.moveItem(at: part, to: root.appendingPathComponent("flyttad\(partSuffix)"))
+    assert(leftoverParts(on: [d]).isEmpty, "en borttagen delfil ska inte visas")
 }
 
 /// Mappar på disken (enligt dess lista) som heter något av `names`, t.ex. "BLF 26 2" på både MA 2 TB och Wildermark.
@@ -537,6 +566,9 @@ func setDiscarded(_ files: [CardFile], _ on: Bool, store: URL = discardedURL()) 
 }
 
 func runSelfTest() {
+    testXXH64()
+    testFormats()
+    testLeftoverParts()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
@@ -609,7 +641,7 @@ func mdEscape(_ s: String) -> String {
     return r
 }
 
-/// En kopia räknas bara om innehållet är identiskt (SHA-256), aldrig på namn.
+/// En kopia räknas bara om innehållet är identiskt (xxHash-64), aldrig på namn.
 func findBackup(of file: CardFile, among candidates: [URL], cardRoot: URL) -> URL? {
     verifyBackup(of: file, among: sameSize(as: file, among: candidates, cardRoot: cardRoot))
 }
@@ -638,25 +670,25 @@ func samplesMatch(_ a: URL, _ b: URL, size: Int64) -> Bool {
     return true
 }
 
-/// Steg 2: jämför innehållet byte för byte (SHA-256). Kortet och första kandidaten läses samtidigt,
+/// Steg 2: jämför hela innehållet (xxHash-64). Kortet och första kandidaten läses samtidigt,
 /// eftersom de ligger på olika enheter. `progress` får antal lästa byte från kortet.
 func verifyBackup(of file: CardFile, among candidates: [URL], progress: ((Int) -> Void)? = nil) -> URL? {
     guard let first = candidates.first else { return nil }
-    var cardHash: SHA256.Digest?, firstHash: SHA256.Digest?
+    var cardHash: UInt64?, firstHash: UInt64?
     DispatchQueue.concurrentPerform(iterations: 2) { k in
-        if k == 0 { cardHash = try? sha256(file.url, progress: progress) } else { firstHash = try? sha256(first) }
+        if k == 0 { cardHash = try? fileHash(file.url, progress: progress) } else { firstHash = try? fileHash(first) }
     }
     guard let h = cardHash else { return nil }
     if firstHash == h { return first }
-    return candidates.dropFirst().first { (try? sha256($0)) == h }
+    return candidates.dropFirst().first { (try? fileHash($0)) == h }
 }
 
-func sha256(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> SHA256.Digest {
+func fileHash(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> UInt64 {
     let h = try FileHandle(forReadingFrom: url)
     defer { try? h.close() }
-    var hasher = SHA256()
+    var hasher = XXH64()
     while let d = try h.read(upToCount: 8 << 20), !d.isEmpty {
-        hasher.update(data: d)
+        hasher.update(d)
         progress?(d.count)
     }
     return hasher.finalize()
@@ -664,83 +696,137 @@ func sha256(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> SHA256.Diges
 
 /// Jämför två filer. De läses samtidigt, eftersom de oftast ligger på olika enheter och väntar på varsin.
 func sameContent(_ a: URL, _ b: URL) throws -> Bool {
-    var ha: Result<SHA256.Digest, Error>!, hb: Result<SHA256.Digest, Error>!
+    var ha: Result<UInt64, Error>!, hb: Result<UInt64, Error>!
     DispatchQueue.concurrentPerform(iterations: 2) { k in
-        if k == 0 { ha = Result { try sha256(a) } } else { hb = Result { try sha256(b) } }
+        if k == 0 { ha = Result { try fileHash(a) } } else { hb = Result { try fileHash(b) } }
     }
     return try ha.get() == hb.get()
 }
 
 /// Kopierar och kontrollerar att kopian är identisk. Skriver aldrig över en befintlig fil.
 func copyVerified(_ src: URL, to dst: URL) throws {
+    if let error = copyVerified(src, to: [dst])[0] { throw error }
+}
+
+/// Kopierar till flera ställen samtidigt, med en enda läsning av kortet. Svaret har ett fel eller nil per ställe,
+/// så att en disk som krånglar inte stoppar kopian till den andra.
+func copyVerified(_ src: URL, to dsts: [URL]) -> [Error?] {
     let fm = FileManager.default
-    try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
-    if fm.fileExists(atPath: dst.path) {
-        guard try sameContent(src, dst) else { throw CopyError(L("A different file with the same name is already there", "En annan fil med samma namn finns redan där")) }
-        return
+    var results = [Error?](repeating: nil, count: dsts.count)
+    var work: [(index: Int, part: URL)] = []
+    for (i, dst) in dsts.enumerated() {
+        do {
+            try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: dst.path) {
+                if try !sameContent(src, dst) { throw CopyError(L("A different file with the same name is already there", "En annan fil med samma namn finns redan där")) }
+                continue
+            }
+            // Filen får sitt riktiga namn först när den är kontrollerad, så en avbruten kopia ser aldrig ut som en färdig fil.
+            // Filändelsen är inte media, så en kvarlämnad del räknas inte som en fil av appen.
+            work.append((i, dst.deletingLastPathComponent().appendingPathComponent("\(dst.lastPathComponent).\(UUID().uuidString.prefix(8)).wilderloader-part")))
+        } catch { results[i] = error }
     }
-    // Filen får sitt riktiga namn först när den är kontrollerad, så en avbruten kopia ser aldrig ut som en färdig fil.
-    // Filändelsen är inte media, så en kvarlämnad del räknas inte som en fil av appen.
-    let part = dst.deletingLastPathComponent().appendingPathComponent("\(dst.lastPathComponent).\(UUID().uuidString.prefix(8)).wilderloader-part")
-    do {
-        try copyStreaming(src, to: part)
-        guard try sameContent(src, part) else { throw CopyError(L("The copy did not come out identical", "Kopian blev inte identisk")) }
-        try fm.moveItem(at: part, to: dst)  // Misslyckas om filen hunnit dyka upp, så inget skrivs över.
-    } catch {
-        // shortcut: går papperskorgen inte att nå (vanligt på NAS) blir delen kvar, och användaren får ta bort den.
-        try? fm.trashItem(at: part, resultingItemURL: nil)
-        throw error
+    guard !work.isEmpty else { return results }
+
+    let written = copyStreaming(src, to: work.map(\.part))
+    // Kortet och kopiorna läses samtidigt, eftersom de oftast ligger på olika enheter och väntar på varsin.
+    let lock = NSLock()
+    var hashes: [Int: Result<UInt64, Error>] = [:]
+    DispatchQueue.concurrentPerform(iterations: work.count + 1) { k in
+        guard k == 0 || written[k - 1] == nil else { return }
+        let r = Result { try fileHash(k == 0 ? src : work[k - 1].part) }
+        lock.lock(); hashes[k] = r; lock.unlock()
+    }
+    for (k, w) in work.enumerated() {
+        do {
+            if let e = written[k] { throw e }
+            guard try hashes[k + 1]!.get() == hashes[0]!.get() else { throw CopyError(L("The copy did not come out identical", "Kopian blev inte identisk")) }
+            try fm.moveItem(at: w.part, to: dsts[w.index])  // Misslyckas om filen hunnit dyka upp, så inget skrivs över.
+        } catch {
+            // Går papperskorgen inte att nå (vanligt på NAS) blir delen kvar. Nästa skanning hittar den och erbjuder städning.
+            try? fm.trashItem(at: w.part, resultingItemURL: nil)
+            results[w.index] = error
+        }
+    }
+    return results
+}
+
+/// En kopia som skrivs: en liten kö, så att den långsammaste enheten sätter farten och inte summan av alla.
+private final class CopyWriter {
+    let path: String
+    let output: FileHandle?
+    private let lock = NSLock()
+    private var queue: [Data?] = []
+    private var failure: Error?
+    private let free = DispatchSemaphore(value: 4), ready = DispatchSemaphore(value: 0)
+
+    init(_ dst: URL) {
+        path = dst.path
+        let fd = open(dst.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)  // O_EXCL: skriver aldrig över.
+        if fd >= 0 {
+            // Utan cache måste kontrollen läsa kopian från disken, inte från Macens minne.
+            _ = fcntl(fd, F_NOCACHE, 1)
+            output = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        } else {
+            output = nil
+            failure = CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: dst.path, NSUnderlyingErrorKey: POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)])
+        }
+    }
+
+    var error: Error? { lock.lock(); defer { lock.unlock() }; return failure }
+    func fail(_ e: Error) { lock.lock(); if failure == nil { failure = e }; lock.unlock() }
+    func waitForRoom() { free.wait() }
+    func push(_ d: Data?) { lock.lock(); queue.append(d); lock.unlock(); ready.signal() }
+
+    /// Tömmer kön även efter ett fel, så att läsaren aldrig fastnar.
+    func run() {
+        while true {
+            ready.wait()
+            lock.lock(); let next = queue.removeFirst(); lock.unlock()
+            free.signal()
+            guard let d = next else { break }
+            if error != nil { continue }
+            do { try output?.write(contentsOf: d) } catch { fail(error) }
+        }
+        do { try output?.synchronize(); try output?.close() } catch { fail(error) }
     }
 }
 
-/// Läser och skriver samtidigt, med en liten kö emellan, så att den långsammaste enheten sätter farten och inte summan av båda.
-private func copyStreaming(_ src: URL, to dst: URL) throws {
-    let input = try FileHandle(forReadingFrom: src)
-    defer { try? input.close() }
-    let fd = open(dst.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)  // O_EXCL: skriver aldrig över.
-    guard fd >= 0 else { throw CocoaError(.fileWriteNoPermission, userInfo: [NSFilePathErrorKey: dst.path, NSUnderlyingErrorKey: POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)]) }
-    let output = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-    // Utan cache måste kontrollen läsa kopian från disken, inte från Macens minne.
-    _ = fcntl(input.fileDescriptor, F_NOCACHE, 1)
-    _ = fcntl(fd, F_NOCACHE, 1)
-
-    let lock = NSLock()
-    var queue: [Data?] = []
-    var failure: Error?
-    let free = DispatchSemaphore(value: 4), ready = DispatchSemaphore(value: 0)
-    func fail(_ e: Error) { lock.lock(); if failure == nil { failure = e }; lock.unlock() }
-    func failed() -> Bool { lock.lock(); defer { lock.unlock() }; return failure != nil }
-    func push(_ d: Data?) { lock.lock(); queue.append(d); lock.unlock(); ready.signal() }
-
-    DispatchQueue.concurrentPerform(iterations: 2) { k in
-        if k == 0 {
-            // Läsaren avslutar alltid kön med nil, och skrivaren tömmer den även efter ett fel. Så kan ingen av dem fastna.
-            defer { push(nil) }
-            do {
-                while !failed() {
-                    free.wait()
-                    guard let d = try input.read(upToCount: 8 << 20), !d.isEmpty else { return }
-                    push(d)
-                }
-            } catch { fail(error) }
-        } else {
-            while true {
-                ready.wait()
-                lock.lock(); let next = queue.removeFirst(); lock.unlock()
-                free.signal()
-                guard let d = next else { return }
-                if failed() { continue }
-                do { try output.write(contentsOf: d) } catch { fail(error) }
-            }
-        }
+/// Läser källan en gång och skriver till alla kopior samtidigt. Skrivarna har egna trådar, så att de inte kan bli väntande på en ledig plats i en trådpool.
+private func copyStreaming(_ src: URL, to dsts: [URL]) -> [Error?] {
+    let writers = dsts.map(CopyWriter.init)
+    let group = DispatchGroup()
+    for w in writers {
+        group.enter()
+        let t = Thread { w.run(); group.leave() }
+        t.qualityOfService = .userInitiated
+        t.start()
     }
-    do { try output.synchronize(); try output.close() } catch { fail(error) }
-    if let failure { throw failure }
+    var readError: Error?
+    do {
+        let input = try FileHandle(forReadingFrom: src)
+        defer { try? input.close() }
+        _ = fcntl(input.fileDescriptor, F_NOCACHE, 1)
+        // Varje plats som tas i en kö lämnas tillbaka av skrivaren, och kön avslutas alltid med nil nedan.
+        while writers.contains(where: { $0.error == nil }) {
+            writers.forEach { $0.waitForRoom() }
+            guard let d = try input.read(upToCount: 8 << 20), !d.isEmpty else { break }
+            writers.forEach { $0.push(d) }
+        }
+    } catch { readError = error }
+    writers.forEach { $0.push(nil) }
+    group.wait()
 
-    // Datumen avgör vilken fotografering filen hör till, så de sätts även om övrig metadata inte går att föra över.
-    _ = copyfile(src.path, dst.path, nil, copyfile_flags_t(COPYFILE_METADATA))
-    let dates = try FileManager.default.attributesOfItem(atPath: src.path).filter { $0.key == .modificationDate || $0.key == .creationDate }
-    try FileManager.default.setAttributes(dates, ofItemAtPath: dst.path)
+    return writers.enumerated().map { i, w in
+        if let e = readError ?? w.error { return e }
+        do {
+            // Datumen avgör vilken fotografering filen hör till, så de sätts även om övrig metadata inte går att föra över.
+            _ = copyfile(src.path, dsts[i].path, nil, copyfile_flags_t(COPYFILE_METADATA))
+            let dates = try FileManager.default.attributesOfItem(atPath: src.path).filter { $0.key == .modificationDate || $0.key == .creationDate }
+            try FileManager.default.setAttributes(dates, ofItemAtPath: dsts[i].path)
+            return nil
+        } catch { return error }
+    }
 }
 
 /// Kopian ska bli identisk med samma datum, aldrig skriva över och inte fastna eller lämna en falsk fil när disken blir full.
@@ -762,6 +848,17 @@ private func testCopyVerified() {
     assert(try! fm.contentsOfDirectory(atPath: dst.deletingLastPathComponent().path) == ["a.mov"], "inga delar ska bli kvar")
     assert(!isMedia(URL(fileURLWithPath: "a.MOV.1234.wilderloader-part")), "en del ska inte räknas som en fil")
 
+    // Full kontroll: samma namn och storlek räcker inte om en enda bit skiljer, inte ens mitt i filen där stickproven inte läser.
+    let damaged = dir.appendingPathComponent("skadad/a.mov")
+    try! fm.createDirectory(at: damaged.deletingLastPathComponent(), withIntermediateDirectories: true)
+    var flipped = bytes
+    flipped[bytes.count / 4] ^= 1
+    try! flipped.write(to: damaged)
+    let cardFile = CardFile(url: src, rel: "a.mov", size: Int64(bytes.count), date: old)
+    assert(samplesMatch(src, damaged, size: Int64(bytes.count)), "skadan ska ligga där stickproven inte läser")
+    assert(verifyBackup(of: cardFile, among: [damaged]) == nil, "en skadad kopia ska inte godkännas")
+    assert(verifyBackup(of: cardFile, among: [damaged, dst]) == dst, "den hela kopian ska hittas bland flera")
+
     let taken = dir.appendingPathComponent("ut/b.mov")
     try! Data("annan".utf8).write(to: taken)
     assert((try? copyVerified(src, to: taken)) == nil, "en annan fil med samma namn ska ge fel")
@@ -778,6 +875,26 @@ private func testCopyVerified() {
     let full = URL(fileURLWithPath: "/Volumes/\(name)/a.mov")
     assert((try? copyVerified(src, to: full)) == nil, "full disk ska ge fel")
     assert(!fm.fileExists(atPath: full.path), "full disk ska inte ge en falsk fil")
+
+    // Två diskar samtidigt: båda blir identiska, och en full disk får inte stoppa den andra.
+    let one = dir.appendingPathComponent("tva/ett/a.mov"), two = dir.appendingPathComponent("tva/tva/a.mov")
+    let both = copyVerified(src, to: [one, two])
+    assert(both[0] == nil && both[1] == nil, "\(both)")
+    assert(try! Data(contentsOf: one) == bytes && Data(contentsOf: two) == bytes, "båda kopiorna ska vara identiska")
+    assert((try! fm.attributesOfItem(atPath: two.path)[.modificationDate] as! Date) == old, "datumet ska följa med till båda")
+    let good = dir.appendingPathComponent("tva/god/a.mov")
+    let mixed = copyVerified(src, to: [full, good])
+    assert(mixed[0] != nil && mixed[1] == nil, "\(mixed)")
+    assert(try! Data(contentsOf: good) == bytes, "kopian på den friska disken ska bli hel")
+    assert(!fm.fileExists(atPath: full.path), "den fulla disken ska inte få en falsk fil")
+    let oneTaken = dir.appendingPathComponent("tva/upptagen/a.mov"), other = dir.appendingPathComponent("tva/annan/a.mov")
+    try! fm.createDirectory(at: oneTaken.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try! Data("annan".utf8).write(to: oneTaken)
+    let takenResult = copyVerified(src, to: [oneTaken, other])
+    assert(takenResult[0] != nil && takenResult[1] == nil, "\(takenResult)")
+    assert(try! Data(contentsOf: oneTaken) == Data("annan".utf8), "befintlig fil ska inte skrivas över")
+    let badSource = copyVerified(dir.appendingPathComponent("finns-inte.mov"), to: [dir.appendingPathComponent("tva/x/a.mov"), dir.appendingPathComponent("tva/y/a.mov")])
+    assert(badSource[0] != nil && badSource[1] != nil, "saknad källa ska ge fel på båda")
 }
 
 struct CopyError: LocalizedError {

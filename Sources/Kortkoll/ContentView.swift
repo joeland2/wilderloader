@@ -25,13 +25,13 @@ private let onOk = Color(red: 0.039, green: 0.039, blue: 0.039)
 /// Rubriktypsnittet, inbyggt i appen (Resources/Fonts). Faller tillbaka på systemtypsnittet om det saknas.
 private func display(_ size: CGFloat) -> Font { .custom("Bebas Neue", size: size) }
 
-enum LinkKind { case found, verifying, missing, copying, failed, idle }
+enum LinkKind { case found, listed, verifying, missing, copying, failed, idle }
 
 /// "BOSS 14TB / Hus" för /Volumes/BOSS 14TB/Hus, "Den här Macen / Documents" för hemmappen.
-func placeLabel(_ dir: String) -> String {
+func placeLabel(_ dir: String, full: Bool = false) -> String {
     #if DEBUG
     // Demodiskarna ligger i en tillfällig mapp men ska se ut som riktiga diskar.
-    if let r = dir.range(of: "/stf-demo/") { return placeLabel("/Volumes/" + dir[r.upperBound...]) }
+    if let r = dir.range(of: "/stf-demo/") { return placeLabel("/Volumes/" + dir[r.upperBound...], full: full) }
     #endif
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     let disk: String
@@ -44,7 +44,7 @@ func placeLabel(_ dir: String) -> String {
         disk = L("This Mac", "Den här Macen")
         parts = (dir.hasPrefix(home) ? dir.dropFirst(home.count) : Substring(dir)).split(separator: "/")
     }
-    return ([disk] + parts.suffix(2).map(String.init)).joined(separator: " / ")
+    return ([disk] + (full ? parts : parts.suffix(2)).map(String.init)).joined(separator: " / ")
 }
 
 /// En ruta i raden längst ner: en disk, eller en plats för filer som saknas eller misslyckades.
@@ -56,6 +56,8 @@ struct Tile: Identifiable {
     let icon: String
     var row: DiskRow?
     var found = 0
+    /// Den del av `found` som bara finns i listan för en urkopplad disk.
+    var listed = 0
     var copying = 0
     var verifying = 0
     var count = 0
@@ -90,10 +92,19 @@ extension Model {
                     if let i = index(of: c) { if seen.insert(i).inserted { out[i].found += 1; out[i].urls.append(c) } }
                 }
                 if seen.isEmpty { other.found += 1; other.urls.append(u) }
+            case .listed(let u):
+                var seen = Set<Int>()
+                for c in [u] + it.copies {
+                    if let i = index(of: c), seen.insert(i).inserted { out[i].found += 1; out[i].listed += 1; out[i].urls.append(c) }
+                }
+                if seen.isEmpty { other.found += 1; other.listed += 1; other.urls.append(u) }
             case .verifying(let u):
                 if let i = index(of: u) { out[i].verifying += 1; out[i].urls.append(u) } else { other.verifying += 1; other.urls.append(u) }
             case .missing:
-                if let to = copyingTo, let i = index(of: to) { out[i].copying += 1 } else { missing.count += 1; missing.urls.append(it.file.url) }
+                if let to = copyingTo, let i = index(of: to) {
+                    out[i].copying += 1
+                    if let also = copyingAlso, let k = index(of: also), k != i { out[k].copying += 1 }
+                } else { missing.count += 1; missing.urls.append(it.file.url) }
             case .discarded: culled.count += 1; culled.urls.append(it.file.url)
             case .failed: failed.count += 1; failed.urls.append(it.file.url)
             }
@@ -119,6 +130,7 @@ struct ContentView: View {
     @State private var formatting = false
     @State private var why = false
     @State private var fullInfo = false
+    @State private var cleaning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -146,6 +158,20 @@ struct ContentView: View {
         return HStack(spacing: 8) {
             Text(L("IN", "IN")).font(display(15)).tracking(1.5).foregroundStyle(mute)
             Spacer()
+            if !m.leftovers.isEmpty && m.copyingTo == nil {
+                Button { cleaning = true } label: {
+                    Label(L("\(m.leftovers.count) unfinished \(m.leftovers.count == 1 ? "copy" : "copies")", "\(m.leftovers.count) \(m.leftovers.count == 1 ? "avbruten kopia" : "avbrutna kopior")"), systemImage: "trash")
+                }
+                .buttonStyle(.plain).font(.system(size: 11, weight: .semibold)).foregroundStyle(miss)
+                .padding(.trailing, 10)
+                .help(L("Leftovers from interrupted copies. They take up space but are not usable files.", "Rester från avbrutna kopior. De tar plats men är inga användbara filer."))
+                .confirmationDialog(L("Move \(m.leftovers.count) unfinished \(m.leftovers.count == 1 ? "copy" : "copies") to the Trash?", "Lägga \(m.leftovers.count) \(m.leftovers.count == 1 ? "avbruten kopia" : "avbrutna kopior") i papperskorgen?"), isPresented: $cleaning) {
+                    Button(L("Move to Trash", "Lägg i papperskorgen"), role: .destructive) { m.trashLeftovers() }
+                    Button(L("Cancel", "Avbryt"), role: .cancel) {}
+                } message: {
+                    Text(m.leftovers.prefix(5).map(\.lastPathComponent).joined(separator: "\n"))
+                }
+            }
             Toggle(L("Full check", "Full kontroll"), isOn: $m.fullCheck)
                 .toggleStyle(.switch).controlSize(.mini).font(.system(size: 11, weight: .medium)).foregroundStyle(mute)
                 .help(L("Compares every file byte by byte. Safest, but reads the whole card and every copy.", "Jämför varje fil byte för byte. Säkrast, men läser hela kortet och alla kopior."))
@@ -302,22 +328,37 @@ struct ContentView: View {
             if m.formatting {
                 ProgressView().controlSize(.small)
                 Text(L("Formatting…", "Formaterar…")).font(.system(size: 13, weight: .semibold))
-            } else if m.allSafe && m.canFormat {
+            } else if m.formatReady && m.canFormat {
                 Button { formatting = true } label: {
                     Text(L("✓ Format the card…", "✓ Formatera kortet…")).font(.system(size: 13, weight: .bold)).foregroundStyle(ok)
                         .padding(.horizontal, 16).padding(.vertical, 8)
                         .overlay(RoundedRectangle(cornerRadius: 4).stroke(ok))
                 }
                 .buttonStyle(.plain)
-                .help(L("Everything on the card is on another disk", "Allt på kortet finns på en annan disk"))
-            } else if m.allSafe {
+                .help(L("Everything on the card is on another disk and fully checked", "Allt på kortet finns på en annan disk och är fullt kontrollerat"))
+            } else if m.formatReady {
                 Text(L("✓ Safe to format", "✓ Kan formateras")).font(.system(size: 13, weight: .bold)).foregroundStyle(ok)
                     .padding(.horizontal, 16).padding(.vertical, 8)
                     .overlay(RoundedRectangle(cornerRadius: 4).stroke(ok))
-            } else if !m.busy && m.canFormat && !m.items.isEmpty {
-                Button(L("Format anyway…", "Formatera ändå…")) { formatting = true }
-                    .buttonStyle(.borderless).foregroundStyle(mute).font(.system(size: 12))
-                    .help(L("Files that are only on the card will be lost", "Filerna som bara finns på kortet försvinner"))
+            } else {
+                if m.allSafe && m.unverified > m.awayOnly {
+                    Button { m.fullCheck = true } label: {
+                        Text(L("Run Full check", "Kör Full kontroll")).font(.system(size: 13, weight: .bold)).foregroundStyle(ok)
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .overlay(RoundedRectangle(cornerRadius: 4).stroke(ok))
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Compares every file with its copy before you format", "Jämför varje fil med kopian innan du formaterar"))
+                }
+                if !m.busy && !m.otherFiles.isEmpty {
+                    Button(L("Show them", "Visa dem")) { NSWorkspace.shared.activateFileViewerSelecting(m.otherFiles) }
+                        .buttonStyle(.borderless).foregroundStyle(miss).font(.system(size: 12, weight: .semibold))
+                }
+                if !m.busy && m.canFormat && (!m.items.isEmpty || !m.otherFiles.isEmpty) {
+                    Button(L("Format anyway…", "Formatera ändå…")) { formatting = true }
+                        .buttonStyle(.borderless).foregroundStyle(mute).font(.system(size: 12))
+                        .help(L("Not everything is confirmed to be on another disk", "Allt är inte bekräftat på en annan disk"))
+                }
             }
         }
         .frame(minHeight: 36)
@@ -338,8 +379,14 @@ struct ContentView: View {
             let note = unscanned > 0 ? L(" · \(unscanned) \(unscanned == 1 ? "disk" : "disks") not scanned", " · \(unscanned) \(unscanned == 1 ? "disk" : "diskar") inte skannade") : ""
             return (L("\(m.missing.count) \(m.missing.count == 1 ? "file has" : "files have") no place yet\(note)", "\(m.missing.count) \(m.missing.count == 1 ? "fil" : "filer") har ingen plats än\(note)"), miss)
         }
+        if !m.otherFiles.isEmpty {
+            let kinds = describeKinds(m.otherFiles)
+            return (L("Other files on the card can't be checked: \(kinds)", "Andra filer på kortet går inte att kontrollera: \(kinds)"), miss)
+        }
         if total == 0 { return (L("The card is empty", "Kortet är tomt"), mute) }
-        return (m.fullCheck ? L("Everything is there, checked byte by byte", "Allt finns och är kontrollerat byte för byte") : L("Everything is there · name, size and samples match", "Allt finns · namn, storlek och stickprov stämmer"), ok)
+        if m.awayOnly > 0 { return (L("\(m.awayOnly) \(m.awayOnly == 1 ? "file is" : "files are") only listed on a disconnected disk · connect it to check", "\(m.awayOnly) \(m.awayOnly == 1 ? "fil finns" : "filer finns") bara i listan för en urkopplad disk · koppla in den för att kontrollera"), miss) }
+        if m.unverified > 0 { return (L("Everything is there · name, size and samples match · not fully checked", "Allt finns · namn, storlek och stickprov stämmer · inte fullt kontrollerat"), ok) }
+        return (L("Everything is there and fully checked", "Allt finns och är fullt kontrollerat"), ok)
     }
 
 }
@@ -739,7 +786,7 @@ struct Flow<Card: View>: View {
         let here = Set(tiles[l.tile].urls)
         let belongs = { (it: Item) -> Bool in
             switch (l.kind, it.status) {
-            case (.found, .found(let u)), (.found, .copied(let u)): return here.contains(u) || it.copies.contains(where: here.contains)
+            case (.found, .found(let u)), (.found, .copied(let u)), (.listed, .listed(let u)): return here.contains(u) || it.copies.contains(where: here.contains)
             case (.verifying, .verifying(let u)): return here.contains(u)
             case (.missing, .missing), (.copying, .missing), (.failed, .failed): return true
             default: return false
@@ -760,7 +807,8 @@ struct Flow<Card: View>: View {
             case .failed: out.append(.init(tile: i, kind: .failed))
             case .discarded: out.append(.init(tile: i, kind: .idle))
             case .disk:
-                if t.found > 0 { out.append(.init(tile: i, kind: .found)) }
+                if t.found > t.listed { out.append(.init(tile: i, kind: .found)) }
+                if t.listed > 0 { out.append(.init(tile: i, kind: .listed)) }
                 if t.verifying > 0 { out.append(.init(tile: i, kind: .verifying)) }
                 if t.copying > 0 { out.append(.init(tile: i, kind: .copying)) }
                 if t.found + t.verifying + t.copying == 0 { out.append(.init(tile: i, kind: .idle)) }
@@ -772,6 +820,7 @@ struct Flow<Card: View>: View {
     private func look(_ k: LinkKind) -> (Color, StrokeStyle) {
         switch k {
         case .found: return (safe, .init(lineWidth: 2.5, lineCap: .round))
+        case .listed: return (ok.opacity(0.8), .init(lineWidth: 2.5, lineCap: .round, dash: [0.5, 6]))
         case .verifying: return (safe.opacity(0.45), .init(lineWidth: 2, lineCap: .round, dash: [4, 4]))
         case .copying: return (copy, .init(lineWidth: 2.5, lineCap: .round, dash: [8, 6]))
         case .missing: return (miss, .init(lineWidth: 2, lineCap: .round, dash: [6, 5]))
@@ -847,6 +896,7 @@ struct HelpGuide: View {
                 section(L("The lines", "Linjerna"))
                 row({ line(ok) }, L("The files are there and match.", "Filerna finns där och stämmer."))
                 row({ line(ok.opacity(0.45), dash: [4, 4]) }, L("Found, but still being checked byte by byte (Full check).", "Hittad, men kontrolleras fortfarande byte för byte (Full kontroll)."))
+                row({ line(ok.opacity(0.8), dash: [0.5, 6]) }, L("Only in the list for a disconnected disk. Connect it to check.", "Finns bara i listan för en urkopplad disk. Koppla in den för att kontrollera."))
                 row({ line(miss, dash: [6, 5]) }, L("Only on the card. Copy before you format.", "Finns bara på kortet. Kopiera innan du formaterar."))
                 row({ line(copy, dash: [8, 6]) }, L("Being copied now.", "Kopieras nu."))
                 row({ line(idle, dash: [2, 5]) }, L("Nothing from the card on that disk.", "Inget från kortet på den disken."))
@@ -931,7 +981,7 @@ struct TileView: View {
 
     var body: some View {
         let accent: Color? = tile.kind == .missing ? (tile.count > 0 ? miss : nil) : tile.kind == .failed ? fail
-            : tile.copying > 0 ? copy : tile.found + tile.verifying > 0 ? safe : nil
+            : tile.copying > 0 ? copy : tile.found - tile.listed + tile.verifying > 0 ? safe : tile.listed > 0 ? ok : nil
         let badge = tile.kind == .disk ? tile.found + tile.verifying + tile.copying : tile.count
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
@@ -1059,7 +1109,7 @@ extension Model {
             for it in items(in: group) {
                 var urls = it.copies
                 switch it.status {
-                case .found(let u), .copied(let u), .verifying(let u): urls.append(u)
+                case .found(let u), .listed(let u), .copied(let u), .verifying(let u): urls.append(u)
                 default: break
                 }
                 let here = Set(urls).filter { $0.standardizedFileURL.path.hasPrefix(prefix) }
@@ -1341,7 +1391,7 @@ struct TileDetail: View {
                                     Button(L("I culled them", "Jag rensade bort dem")) { m.markDiscarded(Set(files), true); dismiss() }
                                     if let k = kept[dir] {
                                         Button(L("Put them in \(k.dir.lastPathComponent)", "Lägg dem i \(k.dir.lastPathComponent)")) {
-                                            m.copyMissing(Set(files), to: k.dir, byDate: false, withCable: false); dismiss()
+                                            m.copyMissing(Set(files), to: k.dir, withCable: false); dismiss()
                                         }
                                         .help(placeLabel(k.dir.path))
                                     }
@@ -1438,7 +1488,7 @@ struct TileDetail: View {
     private var keptByDay: [String: (dir: URL, count: Int)] {
         var tally: [String: [URL: Int]] = [:]
         for it in m.items {
-            if case .found(let u) = it.status { tally[dayString(it.file.date), default: [:]][u.deletingLastPathComponent(), default: 0] += 1 }
+            if let u = it.status.foundURL { tally[dayString(it.file.date), default: [:]][u.deletingLastPathComponent(), default: 0] += 1 }
         }
         return tally.mapValues { dirs in (dirs.max { $0.value < $1.value }!.key, dirs.values.reduce(0, +)) }
     }
@@ -1625,8 +1675,19 @@ struct LandingSheet: View {
     @State private var listing: [URL: [URL]] = [:]
     @State private var newName = ""
     @State private var problem: String?
+    /// Mappmallen och fälten sparas, så att nästa kort från samma jobb hamnar rätt direkt.
+    @AppStorage("folderTemplate") private var template = dateTemplate
+    @AppStorage("folderProject") private var project = ""
+    @AppStorage("folderCamera") private var camera = ""
+    @State private var customTemplate = false
+    /// Andra disken, som får samma filer samtidigt.
+    @State private var second: Disk?
+    @State private var secondFolder: URL?
 
-    init(files: [CardFile], disk: Disk, start: URL, extra: Bool = false, anyStatus: Bool = false, canChangeDisk: Bool = false, onStart: @escaping () -> Void = {}) {
+    init(files: [CardFile], disk: Disk, start: URL, extra: Bool = false, anyStatus: Bool = false, canChangeDisk: Bool = false, second: Disk? = nil, secondFolder: URL? = nil, onStart: @escaping () -> Void = {}) {
+        _second = State(initialValue: second)
+        _secondFolder = State(initialValue: secondFolder)
+        days = Set(files.map { dayString($0.date) }).sorted()
         self.files = files
         self.extra = extra
         self.anyStatus = anyStatus
@@ -1647,12 +1708,83 @@ struct LandingSheet: View {
         }
         return out
     }
-    private var days: [String] { Set(files.map { dayString($0.date) }).sorted() }
+    /// Räknas ut en gång: rutan ritas om ofta, och ett kort kan ha tusentals filer.
+    private let days: [String]
     /// Är den valda mappen redan datummappen läggs ingen till.
     private var dated: Bool { !(days.count == 1 && folder.lastPathComponent == days[0]) && !(extra && homes[folder] != nil) }
-    private var destinations: [URL] { dated ? days.map { dirURL(folder.appendingPathComponent($0)) } : [folder] }
+    /// Mallen för just den här kopieringen. Är den valda mappen redan datummappen läggs inget datum till.
+    private var activeTemplate: String {
+        dated ? template : template.split(separator: "/").filter { $0 != "{date}" }.joined(separator: "/")
+    }
+    private func subfolder(_ f: CardFile) -> String { renderTemplate(activeTemplate, project: project, camera: camera, date: f.date) }
+    /// Mappvägarna, en per inspelningsdag.
+    private var paths: [String] { Array(Set(days.map { renderTemplate(activeTemplate, project: project, camera: camera, day: $0) })).sorted() }
+    private func places(in base: URL) -> [URL] { Array(Set(paths.map { dirURL(templatePlace(base, $0)) })).sorted { $0.path < $1.path } }
+    private var destinations: [URL] { places(in: folder) }
     /// Filerna finns redan i mappen de skulle hamna i, och inget skrivs över.
     private var alreadyHere: Bool { extra && destinations.contains { homes[$0] != nil } }
+    /// Mallen behöver ett projektnamn eller en kamera som inte är ifyllda.
+    private var missingField: Bool {
+        (template.contains("{project}") && project.trimmingCharacters(in: .whitespaces).isEmpty)
+            || (template.contains("{camera}") && camera.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
+
+    private func chip(_ title: String, on: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                .foregroundStyle(on ? onOk : fg)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 4).fill(on ? accent : panel))
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(on ? accent : panelLine))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Hur filerna ordnas i den valda mappen.
+    private var templateRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(L("FOLDERS", "MAPPAR")).font(display(15)).tracking(1.5).foregroundStyle(mute).frame(width: 74, alignment: .leading)
+                chip(L("By date", "Per datum"), on: !customTemplate && template == dateTemplate) { template = dateTemplate; customTemplate = false }
+                chip(L("Project / RAW / Camera / Date", "Projekt / RAW / Kamera / Datum"), on: !customTemplate && template == filmTemplate) {
+                    template = filmTemplate; customTemplate = false
+                    if camera.isEmpty { camera = m.card?.lastPathComponent ?? "" }
+                }
+                chip(L("Straight in", "Direkt i mappen"), on: !customTemplate && template.isEmpty) { template = ""; customTemplate = false }
+                chip(L("Custom", "Egen"), on: customTemplate) { customTemplate = true }
+            }
+            if customTemplate {
+                TextField("{project}/RAW/{camera}/{date}", text: $template).textFieldStyle(.roundedBorder).font(.system(size: 12, design: .monospaced))
+            }
+            if template.contains("{project}") || template.contains("{camera}") {
+                HStack(spacing: 8) {
+                    if template.contains("{project}") { TextField(L("Project", "Projekt"), text: $project).textFieldStyle(.roundedBorder) }
+                    if template.contains("{camera}") { TextField(L("Camera", "Kamera"), text: $camera).textFieldStyle(.roundedBorder) }
+                }
+            }
+        }
+    }
+
+    /// Andra disken: samma filer samtidigt, och samma mappväg som på den första.
+    private var secondRow: some View {
+        HStack(spacing: 6) {
+            Text(L("ALSO TO", "ÄVEN TILL")).font(display(15)).tracking(1.5).foregroundStyle(mute).frame(width: 74, alignment: .leading)
+            chip(L("No", "Nej"), on: second == nil) { second = nil; secondFolder = nil }
+            ForEach(m.copyTargets.filter { $0.key != disk.key }, id: \.key) { d in
+                chip(d.name, on: second?.key == d.key) {
+                    second = d
+                    secondFolder = dirURL(m.likelyFolder(for: files, on: d))
+                }
+            }
+            if let second, let secondFolder {
+                Spacer(minLength: 4)
+                Button(L("Change folder…", "Byt mapp…")) {
+                    if let picked = m.pickFolder(in: secondFolder), picked.path.hasPrefix(dirURL(second.root).path) { self.secondFolder = dirURL(picked) }
+                }
+                .font(.system(size: 12))
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1672,6 +1804,7 @@ struct LandingSheet: View {
                             disk = d
                             folder = dirURL(m.likelyFolder(for: files, on: d))
                             problem = nil
+                            if second?.key == d.key { second = nil; secondFolder = nil }
                         } label: {
                             Text(d.name).font(display(16)).tracking(0.6).lineLimit(1)
                                 .foregroundStyle(on ? onOk : fg)
@@ -1699,11 +1832,17 @@ struct LandingSheet: View {
                 Button(L("Create", "Skapa"), action: createFolder).disabled(cleanName.isEmpty)
             }
             if let problem { Text(problem).font(.system(size: 12)).foregroundStyle(fail) }
+            templateRow
+            secondRow
             VStack(alignment: .leading, spacing: 4) {
                 Text(alreadyHere ? L("ALREADY HERE", "FINNS REDAN HÄR") : L("ENDS UP IN", "HAMNAR I")).font(display(15)).tracking(1.5).foregroundStyle(alreadyHere ? safe : mute)
-                ForEach(destinations, id: \.self) { d in
-                    Label(placeLabel(d.path), systemImage: "folder.fill")
-                        .font(.system(size: 13)).lineLimit(1).truncationMode(.head)
+                // Två rader per disk räcker för att se vägen. Många inspelningsdagar ska inte trycka ut knapparna ur rutan.
+                ForEach(destinations.prefix(2) + (secondFolder.map { places(in: $0).prefix(2) } ?? []), id: \.self) { d in
+                    Label(placeLabel(d.path, full: true), systemImage: "folder.fill")
+                        .font(.system(size: 13)).lineLimit(1).truncationMode(.middle)
+                }
+                if destinations.count > 2 {
+                    Text(L("+ \(destinations.count - 2) more days", "+ \(destinations.count - 2) dagar till")).font(.system(size: 11)).foregroundStyle(mute)
                 }
             }
             if !anyStatus, let f = m.forward, case let n = m.forwardJobs().count, n > 0 {
@@ -1716,12 +1855,12 @@ struct LandingSheet: View {
                 Spacer()
                 Button(L("Cancel", "Avbryt")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(extra ? L("Make a copy here", "Gör en kopia här") : L("Copy here", "Kopiera hit")) {
-                    m.copyMissing(Set(files.map(\.url)), to: folder, byDate: dated, anyStatus: anyStatus)
+                    m.copyMissing(Set(files.map(\.url)), to: folder, also: secondFolder, subfolder: subfolder, anyStatus: anyStatus)
                     dismiss()
                     onStart()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(alreadyHere)
+                .disabled(alreadyHere || missingField)
             }
         }
         .padding(22)
@@ -1814,11 +1953,14 @@ struct FormatSheet: View {
     var body: some View {
         let name = m.card?.lastPathComponent ?? ""
         let lost = m.missing.count + m.failed.count
+        let unchecked = m.unverified
+        let others = m.otherFiles.count
+        let clear = lost == 0 && unchecked == 0 && others == 0
         let size = (try? m.card?.resourceValues(forKeys: [.volumeTotalCapacityKey]).volumeTotalCapacity).flatMap { $0 }
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 14) {
-                Image(systemName: lost == 0 ? "sdcard" : "exclamationmark.triangle.fill")
-                    .font(.system(size: 28)).foregroundStyle(lost == 0 ? ok : fail).frame(width: 36)
+                Image(systemName: clear ? "sdcard" : "exclamationmark.triangle.fill")
+                    .font(.system(size: 28)).foregroundStyle(clear ? ok : lost > 0 ? fail : miss).frame(width: 36)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(L("Format \(name)?", "Formatera \(name)?")).font(display(24)).tracking(0.8)
                     let cap = size.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
@@ -1827,17 +1969,31 @@ struct FormatSheet: View {
                         .font(.system(size: 12)).foregroundStyle(mute)
                 }
             }
-            if lost == 0 {
-                Label(L("All files are on another disk.", "Alla filer finns på en annan disk."), systemImage: "checkmark.circle.fill").foregroundStyle(ok).font(.system(size: 13))
+            if clear {
+                Label(L("All files are on another disk and fully checked.", "Alla filer finns på en annan disk och är fullt kontrollerade."), systemImage: "checkmark.circle.fill").foregroundStyle(ok).font(.system(size: 13))
             } else {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(L("\(lost) \(lost == 1 ? "file is" : "files are") only on the card and will be gone for good.", "\(lost) \(lost == 1 ? "fil finns" : "filer finns") bara på kortet och försvinner för alltid."))
-                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(fail)
+                    if lost > 0 {
+                        Text(L("\(lost) \(lost == 1 ? "file is" : "files are") only on the card and will be gone for good.", "\(lost) \(lost == 1 ? "fil finns" : "filer finns") bara på kortet och försvinner för alltid."))
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(fail)
+                    }
+                    if unchecked > 0 {
+                        Text(L("\(unchecked) \(unchecked == 1 ? "file has" : "files have") not had a full check. A copy could be damaged or a different file.", "\(unchecked) \(unchecked == 1 ? "fil har" : "filer har") inte fått en full kontroll. En kopia kan vara skadad eller en annan fil."))
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(miss).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if others > 0 {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(L("\(others) other \(others == 1 ? "file" : "files") can't be checked and will be erased too: \(describeKinds(m.otherFiles)).", "\(others) \(others == 1 ? "annan fil" : "andra filer") går inte att kontrollera och raderas också: \(describeKinds(m.otherFiles))."))
+                                .font(.system(size: 13, weight: .semibold)).foregroundStyle(miss).fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            Button(L("Show", "Visa")) { NSWorkspace.shared.activateFileViewerSelecting(m.otherFiles) }
+                        }
+                    }
                     Text(L("Type the card's name, \(name), to format anyway.", "Skriv kortets namn, \(name), för att formatera ändå.")).font(.system(size: 12)).foregroundStyle(mute)
                     TextField(name, text: $typed).textFieldStyle(.roundedBorder).frame(width: 220)
                 }
                 .padding(12)
-                .background(RoundedRectangle(cornerRadius: 4).fill(fail.opacity(0.12)))
+                .background(RoundedRectangle(cornerRadius: 4).fill((lost > 0 ? fail : miss).opacity(0.12)))
             }
             if m.awayOnly > 0 {
                 Text(L("\(m.awayOnly) files were matched by name and size against the list of a disconnected disk. Connect it for a full check.",
@@ -1848,12 +2004,16 @@ struct FormatSheet: View {
                 Text(L("\(m.discarded.count) files you marked as culled are erased too.", "\(m.discarded.count) filer som du markerat som rensade raderas också."))
                     .font(.system(size: 12)).foregroundStyle(mute)
             }
+            if m.minorFiles > 0 {
+                Text(L("\(m.minorFiles) small metadata files, such as XML and thumbnails, aren't compared with any copy.", "\(m.minorFiles) små metadatafiler, som XML och miniatyrer, jämförs inte med någon kopia."))
+                    .font(.system(size: 12)).foregroundStyle(mute).fixedSize(horizontal: false, vertical: true)
+            }
             Text(L("If your camera prefers to format the card itself, do it there instead.", "Vill kameran helst formatera själv kan du göra det där i stället.")).font(.system(size: 11)).foregroundStyle(mute)
             HStack {
                 Spacer()
                 Button(L("Cancel", "Avbryt")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(role: .destructive) { m.formatCard(); dismiss() } label: { Text(L("Format", "Formatera")) }
-                    .disabled(lost > 0 && typed != name)
+                    .disabled(!clear && typed != name)
             }
         }
         .padding(24)

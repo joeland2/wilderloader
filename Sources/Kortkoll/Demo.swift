@@ -68,6 +68,7 @@ enum Demo {
         func foundItem(_ a: (file: CardFile, homes: [URL])) -> Item {
             var it = Item(file: a.file, status: a.homes.first.map { .found($0) } ?? .missing)
             it.copies = a.homes
+            it.verified = true
             return it
         }
 
@@ -109,6 +110,14 @@ enum Demo {
         // 4. Väljaren när filerna redan finns: gröna mappar.
         shot.sheet(AnyView(LandingSheet(files: groups[0].map { all[$0].file }, disk: nas, start: camA, extra: true, anyStatus: true).environmentObject(m).preferredColorScheme(.dark)), "sheet-already")
 
+        // Två diskar samtidigt, med filmmallen.
+        let savedTemplate = UserDefaults.standard.object(forKey: "folderTemplate"), savedProject = UserDefaults.standard.object(forKey: "folderProject"), savedCamera = UserDefaults.standard.object(forKey: "folderCamera")
+        UserDefaults.standard.set(filmTemplate, forKey: "folderTemplate")
+        UserDefaults.standard.set("Coast Film", forKey: "folderProject")
+        UserDefaults.standard.set("Cam A", forKey: "folderCamera")
+        shot.sheet(AnyView(LandingSheet(files: missing, disk: ssd, start: coast, second: nas, secondFolder: dirURL(nas.root)).environmentObject(m).preferredColorScheme(.dark)), "sheet-two-disks")
+        for (k, v) in [("folderTemplate", savedTemplate), ("folderProject", savedProject), ("folderCamera", savedCamera)] { UserDefaults.standard.set(v, forKey: k) }
+
         // 5. Kopierar: en bildruta var 8:e sekund, med riktig tid så att miniatyrerna rör sig längs linjen.
         let target = coast.appendingPathComponent("2026-10-14")
         let todo = m.items.indices.filter { m.items[$0].status == .missing }
@@ -142,6 +151,30 @@ enum Demo {
         shot.save(main, "safe", settle: 1)
 
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format")
+
+        // Allt finns, men en del bara i listan för en urkopplad disk och en del bara efter snabbkollen. Formatering ska då inte erbjudas utan varning.
+        assert(m.formatReady && m.unverified == 0, "kontrollerade filer ska kunna formateras")
+        let checkedItems = m.items
+        for i in groups[0] { m.items[i].status = .listed(all[i].homes[0]); m.items[i].verified = false }
+        for i in groups[1] { m.items[i].verified = false }
+        assert(m.allSafe && !m.formatReady, "okontrollerade filer ska inte räknas som klara")
+        assert(m.awayOnly == groups[0].count && m.unverified == groups[0].count + groups[1].count, "\(m.awayOnly) \(m.unverified)")
+        assert(m.tiles.first { $0.id == "nas" }?.listed == groups[0].count, "linjen ska veta vad som bara finns i listan")
+        m.leftovers = [nas.root.appendingPathComponent("2026/A001.MOV.1a2b3c4d.wilderloader-part")]
+        shot.save(main, "unverified", settle: 1)
+        shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format-unverified")
+        m.leftovers = []
+        m.items = checkedItems
+
+        // Filer appen inte kan kontrollera får aldrig raderas i tysthet, även om allt annat är klart.
+        assert(m.formatReady, "allt kontrollerat")
+        m.otherFiles = [card.appendingPathComponent("A001.XYZ"), card.appendingPathComponent("A002.XYZ")]
+        m.minorFiles = 12
+        assert(!m.formatReady, "okända filer ska spärra")
+        shot.save(main, "other-files", settle: 1)
+        shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format-other")
+        m.otherFiles = []
+        m.minorFiles = 0
 
         // Kartan från pluppen. Saknade filer ingår inte, och en fotografering kan ligga i flera mappar.
         let map = m.diskMap(nas.root)

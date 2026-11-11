@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import QuickLookThumbnailing
+import UserNotifications
 
 @main
 enum Main {
@@ -55,7 +56,15 @@ struct KortkollApp: App {
 enum Status: Equatable {
     /// `verifying`: en fil med samma namn och storlek finns, men innehållet är inte jämfört än.
     /// `discarded`: finns bara på kortet, men du har sagt att du har rensat bort den.
-    case checking, verifying(URL), found(URL), missing, discarded, copied(URL), failed(String)
+    /// `listed`: hittades bara i listan för en urkopplad disk, på namn och storlek. Innehållet går inte att läsa förrän disken sitter i.
+    case checking, verifying(URL), found(URL), listed(URL), missing, discarded, copied(URL), failed(String)
+
+    var foundURL: URL? {
+        switch self {
+        case .found(let u), .listed(let u): return u
+        default: return nil
+        }
+    }
 }
 
 struct DiskRow: Identifiable {
@@ -73,6 +82,8 @@ struct Item: Identifiable {
     let id = UUID()
     let file: CardFile
     var status: Status = .checking
+    /// Hela filen har jämförts med kopian. Snabbkollen räknas inte. Kopior från appen är alltid jämförda.
+    var verified = false
     /// Alla kopior som hittades, inte bara den som visas; så vet kabeln vilka som redan finns på måldisken.
     var copies: [URL] = []
 }
@@ -87,6 +98,11 @@ struct Forward: Equatable {
     /// Kopiera även filer som redan finns någonstans på måldisken, t.ex. till en ny projektmapp.
     var includeExisting = false
 }
+
+/// Fil på kortet, och var den ska hamna.
+typealias CopyJob = (Int, CardFile, [URL])
+/// Höjs när listan över filformat ändras, så att disklistorna görs om.
+private let indexFormatsVersion = 2
 
 @MainActor
 final class Model: ObservableObject {
@@ -104,6 +120,13 @@ final class Model: ObservableObject {
         }
     }
     @Published var copyingTo: URL?
+    /// Andra disken när filerna kopieras till två ställen samtidigt.
+    @Published var copyingAlso: URL?
+    /// Filer på kortet som appen inte kan kontrollera, och de små register- och sidofilerna.
+    @Published var otherFiles: [URL] = []
+    @Published var minorFiles = 0
+    /// Klippens sidofiler. Följer med när klippet kopieras.
+    var sidecars: [URL: [URL]] = [:]
     /// Full kontroll jämför allt byte för byte. Annars räcker namn, storlek och stickprov, vilket tar sekunder.
     @Published var fullCheck = UserDefaults.standard.bool(forKey: "fullCheck") {
         didSet {
@@ -204,10 +227,9 @@ final class Model: ObservableObject {
     }
 
     /// Filer som bara hittades på en urkopplad disk, alltså bara mot listan.
-    var awayOnly: Int {
-        let roots = disks.filter(\.disk.offline).map { $0.disk.root.standardizedFileURL.path + "/" }
-        return items.filter { if case .found(let u) = $0.status { return roots.contains { u.standardizedFileURL.path.hasPrefix($0) } }; return false }.count
-    }
+    var awayOnly: Int { items.count { if case .listed = $0.status { return true }; return false } }
+    /// Filer som räknas som säkrade utan att hela innehållet har jämförts.
+    var unverified: Int { items.count { $0.status.foundURL != nil && !$0.verified } }
     var discarded: [Item] { items.filter { $0.status == .discarded } }
 
     /// Markerar kortfiler som rensade, eller ångrar det. Sparas, så att de känns igen nästa gång.
@@ -219,13 +241,15 @@ final class Model: ObservableObject {
     }
     var failed: [Item] { items.filter { if case .failed = $0.status { return true }; return false } }
     var allSafe: Bool { !busy && !items.isEmpty && missing.isEmpty && failed.isEmpty }
+    /// Allt finns på en annan disk och hela innehållet är jämfört. Först då erbjuds formatering utan varning.
+    var formatReady: Bool { allSafe && unverified == 0 && otherFiles.isEmpty }
     /// Mapparna på disken där filerna redan ligger, med hur många i varje.
     func homes(of files: [CardFile], on disk: Disk) -> [URL: Int] {
         let want = Set(files.map(\.url)), root = dirURL(disk.root).path + "/"
         var out: [URL: Int] = [:]
         for it in items where want.contains(it.file.url) {
             var all = it.copies
-            if case .found(let u) = it.status { all.append(u) }
+            if let u = it.status.foundURL { all.append(u) }
             if case .copied(let u) = it.status { all.append(u) }
             let dirs = Set(all.filter { $0.standardizedFileURL.path.hasPrefix(root) }.map { dirURL($0.deletingLastPathComponent()) })
             for d in dirs { out[d, default: 0] += 1 }
@@ -276,13 +300,21 @@ final class Model: ObservableObject {
         forward = nil
         checked = 0
         copyingTo = nil
+        copyingAlso = nil
+        otherFiles = []
+        minorFiles = 0
+        sidecars = [:]
         busy = true
         bytesDone = 0
         bytesTotal = 0
         task = Task.detached(priority: .utility) { [weak self] in
-            let files = listFiles(root)
+            let contents = cardContents(root)
+            let files = contents.files
             await MainActor.run {
                 guard let self else { return }
+                self.otherFiles = contents.other
+                self.minorFiles = contents.minor
+                self.sidecars = contents.sidecars
                 self.items = files.map { Item(file: $0) }
                 self.shoots = shootGroups(files.map(\.date))
             }
@@ -295,6 +327,7 @@ final class Model: ObservableObject {
             let none = { (f: CardFile) -> Status in gone.contains(discardKey(f)) ? .discarded : .missing }
             let full = await MainActor.run { () -> Bool in self?.progressStart = Date(); return self?.fullCheck ?? false }
             var matches: [[URL]] = []
+            var listed: [URL?] = []
             var pending: [(Int, Status, [URL])] = []
             for (i, f) in files.enumerated() {
                 if Task.isCancelled { return }
@@ -302,7 +335,8 @@ final class Model: ObservableObject {
                 // Urkopplade diskar: listan har redan samma namn och storlek, mer går inte att läsa förrän disken sitter i.
                 let away = (cands[f.url.lastPathComponent] ?? []).filter(isOffline)
                 matches.append(m)
-                let st: Status = m.first.map { full ? .verifying($0) : .found($0) } ?? away.first.map { .found($0) } ?? none(f)
+                listed.append(away.first)
+                let st: Status = m.first.map { full ? .verifying($0) : .found($0) } ?? away.first.map { .listed($0) } ?? none(f)
                 pending.append((i, st, m + away))
                 // Uppdatera kartan i omgångar, så att en stor disk fylls på medan man tittar.
                 if pending.count == 25 || i == files.count - 1 {
@@ -312,6 +346,28 @@ final class Model: ObservableObject {
                         guard let self else { return }
                         for (j, st, c) in batch where j < self.items.count { self.items[j].status = st; self.items[j].copies = c }
                         self.checked = i + 1
+                    }
+                }
+            }
+            // Steg 1b: filer utan träff kan ha döpts om. Samma storlek och samma stickprov räknas som en kopia, och Full kontroll jämför sedan hela filen.
+            // Bara inkopplade diskar, eftersom innehållet måste kunna läsas. Högst 16 försök per fil, så att råfiler i samma storlek inte läser hela NAS:en.
+            let lost = files.indices.filter { matches[$0].isEmpty && listed[$0] == nil }
+            if !lost.isEmpty {
+                let bySize = sizeCandidates(Set(lost.map { files[$0].size }), disks: indexableDisks())
+                var renamed: [(Int, URL, [URL])] = []
+                for i in lost {
+                    if Task.isCancelled { return }
+                    let f = files[i]
+                    let m = sameSize(as: f, among: Array((bySize[f.size] ?? []).prefix(16)), cardRoot: root).filter { samplesMatch(f.url, $0, size: f.size) }
+                    guard let first = m.first else { continue }
+                    matches[i] = m
+                    renamed.append((i, first, m))
+                }
+                if !renamed.isEmpty {
+                    let batch = renamed
+                    await MainActor.run {
+                        guard let self else { return }
+                        for (i, u, c) in batch where i < self.items.count { self.items[i].status = full ? .verifying(u) : .found(u); self.items[i].copies = c }
                     }
                 }
             }
@@ -328,9 +384,11 @@ final class Model: ObservableObject {
                 // shortcut: avbrott märks först mellan filer, så en stor film läses klart först.
                 if Task.isCancelled { return }
                 let hit = verifyBackup(of: f, among: matches[i]) { n in Task { @MainActor in self?.bytesDone += Int64(n) } }
+                let away = listed[i]
                 await MainActor.run {
                     guard let self, i < self.items.count else { return }
-                    self.items[i].status = hit.map { .found($0) } ?? none(f)
+                    self.items[i].status = hit.map { .found($0) } ?? away.map { .listed($0) } ?? none(f)
+                    self.items[i].verified = hit != nil
                     self.checked += 1
                 }
             }
@@ -340,12 +398,15 @@ final class Model: ObservableObject {
 
     /// Kopierar de valda filerna som bara finns på kortet till `folder`, med eller utan en undermapp per inspelningsdag.
     /// `anyStatus`: kopierar även filer som redan finns på en annan disk, när du själv har dragit dem hit.
-    func copyMissing(_ only: Set<URL>, to folder: URL, byDate: Bool, withCable: Bool = true, anyStatus: Bool = false) {
+    /// `also`: en andra mapp som får samma filer samtidigt. `subfolder`: mappmallens väg för varje fil.
+    func copyMissing(_ only: Set<URL>, to folder: URL, also: URL? = nil, subfolder: (CardFile) -> String = { _ in "" }, withCable: Bool = true, anyStatus: Bool = false) {
         // shortcut: kamerans undermappar plattas ut; om två filer hamnar på samma ställe med samma namn markeras den andra som misslyckad i stället för att skrivas över.
-        let todo = items.enumerated().filter { (anyStatus || $0.element.status == .missing) && only.contains($0.element.file.url) }.map { i, it in
-            (i, it.file, (byDate ? folder.appendingPathComponent(dayString(it.file.date)) : folder).appendingPathComponent(it.file.url.lastPathComponent))
+        let todo = items.enumerated().filter { (anyStatus || $0.element.status == .missing) && only.contains($0.element.file.url) }.map { i, it -> CopyJob in
+            let sub = subfolder(it.file), name = it.file.url.lastPathComponent
+            func place(_ base: URL) -> URL { templatePlace(base, sub).appendingPathComponent(name) }
+            return (i, it.file, [folder] .map(place) + (also.map { [place($0)] } ?? []))
         }
-        runCopies(todo + (withCable && !anyStatus ? forwardJobs() : []), showing: folder)
+        runCopies(todo + (withCable && !anyStatus ? forwardJobs().map { ($0.0, $0.1, [$0.2]) } : []), showing: folder, also: also)
     }
 
     /// Kabeln mellan två diskar, och fönstret som öppnas när den släpps.
@@ -375,7 +436,7 @@ final class Model: ObservableObject {
               let src = disks.first(where: { $0.id == f.from })?.disk, let dst = disks.first(where: { $0.id == f.to })?.disk else { return [] }
         let srcRoot = src.root.standardizedFileURL.path + "/", dstRoot = dst.root.standardizedFileURL.path + "/"
         return items.enumerated().compactMap { i, it in
-            guard case .found(let u) = it.status, u.standardizedFileURL.path.hasPrefix(srcRoot),
+            guard let u = it.status.foundURL, u.standardizedFileURL.path.hasPrefix(srcRoot),
                   f.includeExisting || !it.copies.contains(where: { $0.standardizedFileURL.path.hasPrefix(dstRoot) }) else { return nil }
             let sub: String
             switch f.layout {
@@ -390,15 +451,36 @@ final class Model: ObservableObject {
 
     func copyForward() {
         guard let f = forward else { return }
-        runCopies(forwardJobs(), showing: f.folder)
+        runCopies(forwardJobs().map { ($0.0, $0.1, [$0.2]) }, showing: f.folder)
+    }
+
+    /// Ljud och notis när kopieringen är klar, så att du kan göra annat under tiden.
+    private func announce(copied: Int, failed: Int) {
+        NSSound(named: failed == 0 ? "Glass" : "Basso")?.play()
+        // Notiser kräver en riktig app. Utan paket, som i ett debug-bygge, skulle anropet krascha.
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        let title = failed == 0 ? L("Copying finished", "Kopieringen är klar") : L("Copying finished with problems", "Kopieringen blev klar med problem")
+        let body = failed == 0
+            ? L("\(copied) \(copied == 1 ? "file" : "files") copied and checked.", "\(copied) \(copied == 1 ? "fil" : "filer") kopierade och kontrollerade.")
+            : L("\(copied) copied · \(failed) could not be copied.", "\(copied) kopierade · \(failed) kunde inte kopieras.")
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert]) { allowed, _ in
+            guard allowed else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+        }
     }
 
     /// Kopierar med kontroll. Saknade filer blir kopierade eller misslyckade; filer som kopieras vidare
     /// finns redan säkert på en disk, så de behåller sin status och ett fel visas i stället efteråt.
-    private func runCopies(_ todo: [(Int, CardFile, URL)], showing folder: URL) {
+    private func runCopies(_ todo: [CopyJob], showing folder: URL, also: URL? = nil) {
         guard !todo.isEmpty else { return }
         busy = true
         copyingTo = folder
+        copyingAlso = also
+        let sides = sidecars
         thumbs = []
         bytesDone = 0
         bytesTotal = todo.reduce(0) { $0 + $1.1.size }
@@ -409,35 +491,53 @@ final class Model: ObservableObject {
         // Användaren väntar på kopieringen. Med lägre prioritet stryper macOS läsningen.
         task = Task.detached(priority: .userInitiated) { [weak self] in
             var copied: [URL] = []
-            var forwardErrors: [String] = []
+            var problems: [String] = []
+            var failedCount = 0
             // Även vid avbrott ska det som hann kopieras in i disklistan.
             defer { addToIndex(copied); logCopies(copied); Task { @MainActor in self?.refreshDisks() } }
-            for (i, f, target) in todo {
+            for (i, f, targets) in todo {
                 if Task.isCancelled { return }
-                var error: String?
-                do { try copyVerified(f.url, to: target); copied.append(target) }
-                catch let e { error = e.localizedDescription }
-                let ok = error == nil
+                let results = copyVerified(f.url, to: targets)
+                let good = zip(targets, results).filter { $0.1 == nil }.map(\.0)
+                let errors = results.compactMap { $0?.localizedDescription }
+                copied += good
+                // Sidofilerna hamnar bredvid varje kopia. De är små, och ett fel på dem visas men stoppar inte kopieringen.
+                for side in sides[f.url] ?? [] {
+                    let places = good.map { $0.deletingLastPathComponent().appendingPathComponent(side.lastPathComponent) }
+                    for case let e? in copyVerified(side, to: places) { problems.append("\(side.lastPathComponent): \(e.localizedDescription)") }
+                }
                 let isMissing = await MainActor.run { () -> Bool in
                     guard let self, i < self.items.count else { return false }
                     let missing = self.items[i].status == .missing
-                    if missing { self.items[i].status = error.map { .failed($0) } ?? .copied(target) }
-                    else if ok { self.items[i].copies.append(target) }
+                    if missing, let first = good.first {
+                        self.items[i].status = .copied(first)
+                        self.items[i].verified = true
+                        self.items[i].copies += good.dropFirst()
+                    } else if missing {
+                        self.items[i].status = .failed(errors.first ?? "")
+                    } else {
+                        self.items[i].copies += good
+                    }
                     self.bytesDone += f.size
                     self.copyDone += 1
                     return missing
                 }
-                if let error, !isMissing { forwardErrors.append("\(f.url.lastPathComponent): \(error)") }
+                if good.isEmpty && isMissing { failedCount += 1 }
+                // Klipp som nu saknas på något av ställena, trots att de finns på kortet och kanske på en annan disk.
+                if !(good.isEmpty && isMissing) { problems += errors.map { "\(f.url.lastPathComponent): \($0)" } }
             }
+            let finishedFiles = copied.count
             await MainActor.run {
                 guard let self else { return }
                 self.busy = false
                 self.copyingTo = nil
+                self.copyingAlso = nil
                 if self.forward != nil && self.forwardJobs().isEmpty { self.forward = nil }
-                if !forwardErrors.isEmpty {
+                self.announce(copied: finishedFiles, failed: failedCount + problems.count)
+                if !problems.isEmpty {
                     let a = NSAlert()
-                    a.messageText = L("\(forwardErrors.count) files could not be copied along the cable", "\(forwardErrors.count) filer kunde inte kopieras längs kabeln")
-                    a.informativeText = L("They are still on the card and on the source disk.\n\n", "De finns fortfarande kvar på kortet och på källdisken.\n\n") + forwardErrors.prefix(8).joined(separator: "\n")
+                    a.messageText = L("\(problems.count) \(problems.count == 1 ? "file" : "files") could not be copied to every place", "\(problems.count) \(problems.count == 1 ? "fil" : "filer") kunde inte kopieras till alla ställen")
+                    a.informativeText = L("The originals are still on the card.\n\n", "Originalen finns kvar på kortet.\n\n") + problems.prefix(8).joined(separator: "\n")
                     a.runModal()
                 }
             }
@@ -461,7 +561,16 @@ final class Model: ObservableObject {
 
     var indexing: Bool { disks.contains { $0.progress != nil } }
 
+    /// Avbrutna kopior på inkopplade diskar, som kan läggas i papperskorgen.
+    @Published var leftovers: [URL] = []
+
+    func trashLeftovers() {
+        trash(leftovers)
+        refreshDisks()
+    }
+
     func refreshDisks() {
+        leftovers = leftoverParts(on: indexableDisks())
         let running = Dictionary(uniqueKeysWithValues: disks.compactMap { r in r.progress.map { (r.id, $0) } })
         disks = allDisks().map { d in
             let info = indexInfo(d)
@@ -502,7 +611,10 @@ final class Model: ObservableObject {
 
     /// Uppdaterar i bakgrunden de listor som är äldre än 12 timmar. Diskar som aldrig skannats väntar på knappen.
     func autoIndex() {
-        index(listDisks.filter { $0.date.map { Date().timeIntervalSince($0) > 12 * 3600 } ?? false }.map(\.disk))
+        // Listor från en version med färre filformat görs om, så att t.ex. BRAW och R3D hittas.
+        let current = UserDefaults.standard.integer(forKey: "indexFormats") == indexFormatsVersion
+        if !current && indexTask == nil { UserDefaults.standard.set(indexFormatsVersion, forKey: "indexFormats") }
+        index(listDisks.filter { $0.date.map { !current || Date().timeIntervalSince($0) > 12 * 3600 } ?? false }.map(\.disk))
     }
 
     private func setProgress(_ key: String, _ n: Int?) {
