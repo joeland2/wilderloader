@@ -148,6 +148,10 @@ final class Model: ObservableObject {
     /// Förlopp i byte för kontroll eller kopiering, för stapeln och tid kvar.
     @Published var bytesDone: Int64 = 0
     @Published var bytesTotal: Int64 = 0
+    /// Byte av kortets filer som kontrollerats efter kopieringen. Kontrollen tar lika lång tid till, så tid kvar räknar med den.
+    @Published var checkBytes: Int64 = 0
+    /// Mappar som kopieras till; skanningar av samma disk väntar under tiden.
+    @Published var pausedScanDirs: [String] = []
     @Published var progressStart = Date()
     @Published var thumbs: [NSImage] = []
     /// De första bilderna på kortet, så att man ser vilket jobb det är.
@@ -485,7 +489,11 @@ final class Model: ObservableObject {
         let sides = sidecars
         thumbs = []
         bytesDone = 0
+        checkBytes = 0
         bytesTotal = todo.reduce(0) { $0 + $1.1.size }
+        pausedScanDirs = Array(Set(todo.flatMap(\.2).map { $0.deletingLastPathComponent().standardizedFileURL.path }))
+        ScanPause.shared.set(pausedScanDirs)
+        let pauseStart = Date()
         copyDone = 0
         copyTotal = todo.count
         progressStart = Date()
@@ -500,12 +508,15 @@ final class Model: ObservableObject {
             for (i, f, targets) in todo {
                 if Task.isCancelled { return }
                 // Förloppet räknas upp under tiden: en enda film kan vara 20 GB.
-                var streamed: Int64 = 0
-                let results = copyVerified(f.url, to: targets) { n in
+                var streamed: Int64 = 0, checked: Int64 = 0
+                let results = copyVerified(f.url, to: targets, progress: { n in
                     streamed += Int64(n)
                     Task { @MainActor in self?.bytesDone += Int64(n) }
-                }
-                let rest = f.size - streamed
+                }, checked: { n in
+                    checked += Int64(n)
+                    Task { @MainActor in self?.checkBytes += Int64(n) }
+                })
+                let rest = f.size - streamed, restChecked = f.size - checked
                 let good = zip(targets, results).filter { $0.1 == nil }.map(\.0)
                 let errors = results.compactMap { $0?.localizedDescription }
                 copied += good
@@ -527,6 +538,7 @@ final class Model: ObservableObject {
                         self.items[i].copies += good
                     }
                     self.bytesDone += rest
+                    self.checkBytes += restChecked
                     self.copyDone += 1
                     return missing
                 }
@@ -540,6 +552,12 @@ final class Model: ObservableObject {
                 self.busy = false
                 self.copyingTo = nil
                 self.copyingAlso = nil
+                // Skanningarna fortsätter, och pausen räknas inte in i deras tid kvar.
+                for i in self.disks.indices where self.pausedScanDirs.contains(where: { inside($0, self.disks[i].disk.root.standardizedFileURL.path) }) {
+                    self.disks[i].scanStart? += Date().timeIntervalSince(pauseStart)
+                }
+                self.pausedScanDirs = []
+                ScanPause.shared.set([])
                 if self.forward != nil && self.forwardJobs().isEmpty { self.forward = nil }
                 self.announce(copied: finishedFiles, failed: failedCount + problems.count)
                 if !problems.isEmpty {

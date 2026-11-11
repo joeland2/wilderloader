@@ -68,8 +68,13 @@ struct Tile: Identifiable {
 }
 
 extension Model {
+    /// Diskarna och platserna i raden längst ner. Det som bara finns på kortet visas som ett frågetecken vid fotograferingen i stället.
+    var tiles: [Tile] { allTiles.filter { $0.kind != .missing } }
+    /// Filerna som bara finns på kortet, för frågetecknet.
+    var missingTile: Tile? { allTiles.first { $0.kind == .missing && $0.count > 0 } }
+
     /// Rutorna och linjerna från kortet till dem.
-    var tiles: [Tile] {
+    private var allTiles: [Tile] {
         let source = card?.standardizedFileURL.path
         var out = disks.filter { $0.disk.root.standardizedFileURL.path != source }.map { r in
             Tile(id: r.id, kind: .disk, name: r.disk.name, icon: diskIcon(r.disk), row: r, root: r.disk.root)
@@ -283,7 +288,9 @@ struct ContentView: View {
     }
 
     private func progressBar(_ color: Color, done: Double, total: Double, label: String) -> some View {
-        let f = min(1, done / max(total, 1))
+        // Vid kopiering läses varje fil en gång till för kontrollen, så arbetet är dubbelt så stort som det som kopieras.
+        let copying = m.copyingTo != nil
+        let f = min(1, (done + (copying ? Double(m.checkBytes) : 0)) / max(total * (copying ? 2 : 1), 1))
         let elapsed = Date().timeIntervalSince(m.progressStart)
         let left = f > 0.02 && elapsed > 3 ? elapsed / f - elapsed : nil
         return VStack(alignment: .leading, spacing: 5) {
@@ -488,6 +495,7 @@ struct Flow<Card: View>: View {
     @State private var mapTile: Tile?
     @State private var copyAfterMap: Disk?
     @State private var retracting = false
+    @State private var missingDetail: Tile?
     /// Nollställs av systemet även när ett drag avbryts, till exempel av ett högerklick, då onEnded aldrig körs.
     @GestureState private var liveDrag = false
 
@@ -531,10 +539,20 @@ struct Flow<Card: View>: View {
             }
 
             let routes = linkList().flatMap { l in sources(of: l, in: shown).map { ($0, l) } }
+            // Fotograferingar med filer som bara finns på kortet: linjen hänger fritt och slutar i ett frågetecken.
+            let asking = ports ? shown.indices.filter { k in m.items(in: shown[k]).contains { $0.status == .missing } } : []
+            let askAt = { (k: Int) in CGPoint(x: shootX(k) + min(44, shootW * 0.35), y: shootY + min(96, (tileTop - shootY) * 0.4)) }
 
             ZStack(alignment: .topLeading) {
                 TimelineView(.animation(paused: !animating || reduceMotion)) { tl in
                     Canvas { ctx, _ in
+                        for k in asking where dragShoot != k {
+                            let a = CGPoint(x: shootX(k), y: shootY), q = askAt(k)
+                            var path = Path()
+                            path.move(to: a)
+                            path.addCurve(to: CGPoint(x: q.x, y: q.y - 11), control1: CGPoint(x: a.x, y: (a.y + q.y) / 2 + 10), control2: CGPoint(x: q.x, y: a.y + 20))
+                            ctx.stroke(path, with: .color(miss), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 5]))
+                        }
                         for (k, l) in routes {
                             let a = CGPoint(x: shown.isEmpty ? w / 2 : shootX(k), y: shootY)
                             let b = CGPoint(x: tileX(l.tile) + (l.kind == .copying ? 18 : 0), y: tileTop)
@@ -696,6 +714,37 @@ struct Flow<Card: View>: View {
                             .accessibilityLabel(L("Port on the shoot", "Port på fotograferingen"))
                     }
 
+                    // Frågetecknet: dra det till en disk för att kopiera, eller klicka för att se filerna.
+                    ForEach(asking, id: \.self) { k in
+                        let n = m.items(in: shown[k]).count { $0.status == .missing }
+                        Text("?").font(.system(size: 12, weight: .bold)).foregroundStyle(miss)
+                            .frame(width: 22, height: 22)
+                            .background(Circle().fill(bg))
+                            .overlay(Circle().stroke(miss, lineWidth: 1.5))
+                            .padding(6)
+                            .contentShape(Circle())
+                            .opacity(dragShoot == k ? 0 : 1)
+                            .position(askAt(k))
+                            .onTapGesture { missingDetail = m.missingTile }
+                            .help(L("\(n) \(n == 1 ? "file has" : "files have") no place yet. Drag to a disk to copy, or click to see them.", "\(n) \(n == 1 ? "fil" : "filer") har ingen plats än. Dra till en disk för att kopiera, eller klicka för att se dem."))
+                            .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("flow"))
+                                .updating($liveDrag) { _, live, _ in live = true }
+                                .onChanged { v in
+                                    guard !retracting else { return }
+                                    dragShoot = k
+                                    dragPoint = v.location
+                                }
+                                .onEnded { v in
+                                    guard !retracting else { return }
+                                    if let j = plug(v.location), let row = tiles[j].row {
+                                        shootCopy = shootCopy(shown[k], to: row.disk)
+                                        dragShoot = nil
+                                    } else { retract(to: askAt(k)) }
+                                })
+                            .accessibilityLabel(L("\(n) files with no place yet", "\(n) filer utan plats än"))
+                            .accessibilityAddTraits(.isButton)
+                    }
+
                     if fwd == nil && pending == nil && dragFrom == nil && tiles.contains(where: { $0.found > 0 }) {
                         Label(L("Drag from the dot under a disk to another disk to put its files there too", "Dra från pricken under en disk till en annan disk för att lägga filerna där också"), systemImage: "hand.draw")
                             .font(.system(size: 11)).foregroundStyle(mute)
@@ -743,6 +792,7 @@ struct Flow<Card: View>: View {
             }) { t in
                 if let disk = t.row?.disk { DiskMapSheet(disk: disk) { copyAfterMap = disk }.environmentObject(m) }
             }
+            .sheet(item: $missingDetail) { t in TileDetail(tile: t).environmentObject(m) }
             .sheet(item: $shootCopy) { c in
                 LandingSheet(files: c.files, disk: c.disk, start: c.start, extra: c.extra, anyStatus: true).environmentObject(m)
             }
@@ -797,7 +847,7 @@ struct Flow<Card: View>: View {
     }
 
     private func linkList() -> [Link] {
-        guard tiles.contains(where: { $0.found + $0.copying + $0.count > 0 }) || tiles.contains(where: { $0.kind == .missing }) else {
+        guard tiles.contains(where: { $0.found + $0.copying + $0.count > 0 }) else {
             return []
         }
         var out: [Link] = []
@@ -971,6 +1021,7 @@ func age(_ d: Date) -> String {
 struct ScanRing: View {
     let row: DiskRow
     let done: Int
+    var paused = false
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1 / 30)) { t in
@@ -984,7 +1035,8 @@ struct ScanRing: View {
                     if let est { Text("\(Int(est.fraction * 100))").font(.system(size: 9, weight: .bold)).monospacedDigit() }
                 }
                 .frame(width: 26, height: 26)
-                if let left = est?.left { Text(leftLabel(left)).font(.system(size: 11)).foregroundStyle(mute).lineLimit(1) }
+                if paused { Text(L("Paused while copying", "Pausad under kopiering")).font(.system(size: 11)).foregroundStyle(mute).lineLimit(1) }
+                else if let left = est?.left { Text(leftLabel(left)).font(.system(size: 11)).foregroundStyle(mute).lineLimit(1) }
             }
         }
         .accessibilityLabel(L("Scanning", "Skannar"))
@@ -1011,7 +1063,7 @@ struct TileView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 if let r = tile.row, let n = r.progress {
-                    ScanRing(row: r, done: n)
+                    ScanRing(row: r, done: n, paused: m.pausedScanDirs.contains { inside($0, r.disk.root.standardizedFileURL.path) })
                 } else {
                     Image(systemName: tile.icon).font(.system(size: 17)).foregroundStyle(accent ?? fg).frame(width: 24, height: 22)
                         .overlay(alignment: .bottomTrailing) {
@@ -1108,6 +1160,8 @@ struct TileView: View {
                 return tile.found > 0 ? L("\(tile.found) · disconnected  ›", "\(tile.found) · urkopplad  ›") : L("Disconnected", "Urkopplad")
             }
             if tile.found > 0 {
+                // Ringen visar hur långt skanningen kommit; raden säger vad ringen är, även när rutan är grön.
+                if tile.row?.progress != nil { return L("\(tile.found) · scanning…", "\(tile.found) · skannas…") }
                 let k = Set(tile.urls.map { $0.deletingLastPathComponent() }).count
                 if k > 1 { return L("\(tile.found) in \(k) folders  ›", "\(tile.found) i \(k) mappar  ›") }
                 return L("\(tile.found) from the card  ›", "\(tile.found) från kortet  ›")

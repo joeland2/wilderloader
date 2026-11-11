@@ -139,6 +139,7 @@ enum Demo {
             }
             m.copyDone = done
             m.bytesDone = doneBytes
+            m.checkBytes = doneBytes
             shot.save(main, String(format: "copy-%02d", f), settle: 0.125, jpeg: true)
         }
 

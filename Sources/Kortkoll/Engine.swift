@@ -322,6 +322,19 @@ func indexInfo(_ d: Disk) -> (count: Int, date: Date)? {
     return (n, date)
 }
 
+/// `p` ligger i mappen `root` eller är den.
+func inside(_ p: String, _ root: String) -> Bool { p == root || p.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
+
+/// Mappar som kopieras till just nu. En skanning av samma disk väntar, så att den inte tar NAS:ens kraft från kopian.
+final class ScanPause {
+    static let shared = ScanPause()
+    private let lock = NSLock()
+    private var dirs: [String] = []
+    func set(_ d: [String]) { lock.lock(); dirs = d; lock.unlock() }
+    func paused(_ root: String) -> Bool { lock.lock(); defer { lock.unlock() }; return dirs.contains { inside($0, root) } }
+    func wait(_ root: String) { while paused(root) && !Task.isCancelled { Thread.sleep(forTimeInterval: 0.5) } }
+}
+
 /// Går igenom hela disken och sparar listan. Anropas med låg prioritet så att macOS bromsar läsningen när datorn behöver kraften.
 @discardableResult
 func buildIndex(_ d: Disk, progress: (Int) -> Void = { _ in }) throws -> Int {
@@ -346,6 +359,7 @@ func buildIndex(_ d: Disk, progress: (Int) -> Void = { _ in }) throws -> Int {
         let path = String(cString: ent.pointee.fts_path)
         let name = path[path.index(after: path.lastIndex(of: "/") ?? path.startIndex)...]
         if info == FTS_D {
+            ScanPause.shared.wait(base)
             // Dolda mappar, Synologys papperskorg, miniatyrmappar och programpaket (deras ikoner) räknas inte som säkerhetskopior.
             if ent.pointee.fts_level > 0 && (name.hasPrefix(".") || name == "#recycle" || name == "@eaDir" || name.hasSuffix(".app") || path == skipDir) {
                 fts_set(fts, ent, FTS_SKIP)
@@ -570,6 +584,7 @@ func runSelfTest() {
     testFormats()
     testLeftoverParts()
     testCopyMemory()
+    testScanPause()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
@@ -593,6 +608,7 @@ func runSelfTest() {
     addToIndex([a, b, b, URL(fileURLWithPath: "/elsewhere/C.JPG")], disks: [d])
     let text = try! String(contentsOf: indexURL(d), encoding: .utf8)
     try? fm.trashItem(at: indexURL(d), resultingItemURL: nil)
+    try? fm.trashItem(at: partsURL(d), resultingItemURL: nil)
     try? fm.trashItem(at: root, resultingItemURL: nil)
     assert(text == "# 2\n10\tP/2026-11-01/A.JPG\n20\tP/2026-11-01/B.JPG\n", text)
 
@@ -714,8 +730,8 @@ func copyVerified(_ src: URL, to dst: URL) throws {
 
 /// Kopierar till flera ställen samtidigt, med en enda läsning av kortet. Svaret har ett fel eller nil per ställe,
 /// så att en disk som krånglar inte stoppar kopian till den andra.
-/// `progress`: antal byte som lästs från kortet, medan filen kopieras.
-func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil) -> [Error?] {
+/// `progress`: antal byte som lästs från kortet, medan filen kopieras. `checked`: byte av kortets fil som kontrollerats efteråt.
+func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, checked: ((Int) -> Void)? = nil) -> [Error?] {
     let fm = FileManager.default
     var results = [Error?](repeating: nil, count: dsts.count)
     var work: [(index: Int, part: URL)] = []
@@ -739,7 +755,7 @@ func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil) 
     var hashes: [Int: Result<UInt64, Error>] = [:]
     DispatchQueue.concurrentPerform(iterations: work.count + 1) { k in
         guard k == 0 || written[k - 1] == nil else { return }
-        let r = Result { try fileHash(k == 0 ? src : work[k - 1].part) }
+        let r = Result { try fileHash(k == 0 ? src : work[k - 1].part, progress: k == 0 ? checked : nil) }
         lock.lock(); hashes[k] = r; lock.unlock()
     }
     for (k, w) in work.enumerated() {
@@ -838,6 +854,24 @@ private func copyStreaming(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)
             return nil
         } catch { return error }
     }
+}
+
+/// En skanning av disken man kopierar till ska vänta tills kopian är klar och sedan bli färdig.
+private func testScanPause() {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("wl-pause-\(UUID().uuidString)")
+    try! fm.createDirectory(at: root.appendingPathComponent("A"), withIntermediateDirectories: true)
+    try! Data(count: 10).write(to: root.appendingPathComponent("A/x.mov"))
+    let d = Disk(key: "selftest-\(UUID().uuidString)", name: "Test", root: root)
+    defer { for u in [root, indexURL(d), partsURL(d)] { try? fm.trashItem(at: u, resultingItemURL: nil) } }
+    assert(inside("/Volumes/A/b", "/Volumes/A") && !inside("/Volumes/AB/b", "/Volumes/A"), "en disk med längre namn är en annan disk")
+    ScanPause.shared.set([root.appendingPathComponent("A").standardizedFileURL.path])
+    let done = DispatchSemaphore(value: 0)
+    Thread { _ = try? buildIndex(d); done.signal() }.start()
+    assert(done.wait(timeout: .now() + 1) == .timedOut, "skanningen ska vänta medan disken kopieras till")
+    ScanPause.shared.set([])
+    assert(done.wait(timeout: .now() + 5) == .success, "skanningen ska fortsätta efteråt")
+    assert(indexInfo(d)?.count == 1, "\(String(describing: indexInfo(d)))")
 }
 
 /// Minnet appen använder just nu.
