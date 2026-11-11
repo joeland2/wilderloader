@@ -889,7 +889,7 @@ struct HelpGuide: View {
                 row({ Text("45").font(.system(size: 11, weight: .bold)).foregroundStyle(onOk).padding(.horizontal, 8).padding(.vertical, 3).background(Capsule().fill(ok)) },
                     L("How many of the card's files are already on the disk. Click the tile to see them.", "Så många av kortets filer som redan finns på disken. Klicka på rutan för att se dem."))
                 row({ HStack(spacing: 6) { Circle().fill(miss).frame(width: 7); Circle().fill(copy).frame(width: 7) } },
-                    L("Yellow dot: the disk isn't scanned yet. Purple: it's being scanned now.", "Gul prick: disken är inte skannad än. Lila: den skannas nu."))
+                    L("Yellow dot: the disk isn't scanned yet. A purple ring: it's being scanned now, and you can keep working meanwhile.", "Gul prick: disken är inte skannad än. Lila ring: den skannas nu, och du kan jobba på under tiden."))
                 row({ Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold)) },
                     L("Rescan just that disk. Shows when the pointer is over the tile, or right-click.", "Skanna om bara den disken. Syns när muspekaren är över rutan, eller högerklicka."))
 
@@ -966,6 +966,31 @@ func age(_ d: Date) -> String {
     return s < 60 ? L("just now", "nyss") : s < 3600 ? "\(s / 60) min" : s < 86400 ? "\(s / 3600) h" : "\(s / 86400) d"
 }
 
+/// Ringen i en disk som skannas: hur långt den kommit mot förra skanningen och ungefär hur länge kvar.
+/// Första gången finns inget att mäta mot, så då snurrar en båge.
+struct ScanRing: View {
+    let row: DiskRow
+    let done: Int
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1 / 30)) { t in
+            let est = scanEstimate(done: done, last: row.count, elapsed: row.scanStart.map { t.date.timeIntervalSince($0) } ?? 0)
+            HStack(spacing: 7) {
+                ZStack {
+                    Circle().stroke(idle, lineWidth: 3)
+                    Circle().trim(from: 0, to: est?.fraction ?? 0.25)
+                        .stroke(copy, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .rotationEffect(.degrees(est == nil ? t.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) * 300 : -90))
+                    if let est { Text("\(Int(est.fraction * 100))").font(.system(size: 9, weight: .bold)).monospacedDigit() }
+                }
+                .frame(width: 26, height: 26)
+                if let left = est?.left { Text(leftLabel(left)).font(.system(size: 11)).foregroundStyle(mute).lineLimit(1) }
+            }
+        }
+        .accessibilityLabel(L("Scanning", "Skannar"))
+    }
+}
+
 struct TileView: View {
     let tile: Tile
     @EnvironmentObject var m: Model
@@ -985,10 +1010,14 @@ struct TileView: View {
         let badge = tile.kind == .disk ? tile.found + tile.verifying + tile.copying : tile.count
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
-                Image(systemName: tile.icon).font(.system(size: 17)).foregroundStyle(accent ?? fg).frame(width: 24, height: 22)
-                    .overlay(alignment: .bottomTrailing) {
-                        if let dot = scanDot { Circle().fill(dot).frame(width: 7, height: 7).overlay(Circle().stroke(panel, lineWidth: 1.5)).offset(x: 4, y: 3) }
-                    }
+                if let r = tile.row, let n = r.progress {
+                    ScanRing(row: r, done: n)
+                } else {
+                    Image(systemName: tile.icon).font(.system(size: 17)).foregroundStyle(accent ?? fg).frame(width: 24, height: 22)
+                        .overlay(alignment: .bottomTrailing) {
+                            if let dot = scanDot { Circle().fill(dot).frame(width: 7, height: 7).overlay(Circle().stroke(panel, lineWidth: 1.5)).offset(x: 4, y: 3) }
+                        }
+                }
                 Spacer(minLength: 0)
                 if hovering, openable != nil {
                     // Klick på rutan visar filerna i Finder, så knappen ger vägen till listan när det finns filer.
@@ -1064,7 +1093,7 @@ struct TileView: View {
 
     private var scanDot: Color? {
         guard tile.kind == .disk, let r = tile.row else { return nil }
-        return r.progress != nil ? copy : r.count == nil ? miss : nil
+        return r.count == nil ? miss : nil
     }
 
     private var detail: String {

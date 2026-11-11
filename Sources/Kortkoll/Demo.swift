@@ -172,6 +172,12 @@ enum Demo {
         m.minorFiles = 12
         assert(!m.formatReady, "okända filer ska spärra")
         shot.save(main, "other-files", settle: 1)
+        // Skanning: NAS:en mäts mot förra listan, MM 2 skannas för första gången.
+        let rows = m.disks
+        m.disks[0].progress = 19_000; m.disks[0].scanStart = Date().addingTimeInterval(-60)
+        m.disks[2].count = nil; m.disks[2].date = nil; m.disks[2].progress = 1_500; m.disks[2].scanStart = Date()
+        shot.save(main, "scanning", settle: 1)
+        m.disks = rows
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format-other")
         m.otherFiles = []
         m.minorFiles = 0

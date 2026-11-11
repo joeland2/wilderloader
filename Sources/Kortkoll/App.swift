@@ -73,6 +73,8 @@ struct DiskRow: Identifiable {
     var date: Date?
     /// Antal filer hittills medan disken skannas, annars nil.
     var progress: Int?
+    /// När pågående skanning startade, för att räkna ut tid kvar.
+    var scanStart: Date?
     /// Hur full disken är, 0–1.
     var fill: Double?
     var id: String { disk.key }
@@ -497,7 +499,13 @@ final class Model: ObservableObject {
             defer { addToIndex(copied); logCopies(copied); Task { @MainActor in self?.refreshDisks() } }
             for (i, f, targets) in todo {
                 if Task.isCancelled { return }
-                let results = copyVerified(f.url, to: targets)
+                // Förloppet räknas upp under tiden: en enda film kan vara 20 GB.
+                var streamed: Int64 = 0
+                let results = copyVerified(f.url, to: targets) { n in
+                    streamed += Int64(n)
+                    Task { @MainActor in self?.bytesDone += Int64(n) }
+                }
+                let rest = f.size - streamed
                 let good = zip(targets, results).filter { $0.1 == nil }.map(\.0)
                 let errors = results.compactMap { $0?.localizedDescription }
                 copied += good
@@ -518,7 +526,7 @@ final class Model: ObservableObject {
                     } else {
                         self.items[i].copies += good
                     }
-                    self.bytesDone += f.size
+                    self.bytesDone += rest
                     self.copyDone += 1
                     return missing
                 }
@@ -571,14 +579,14 @@ final class Model: ObservableObject {
 
     func refreshDisks() {
         leftovers = leftoverParts(on: indexableDisks())
-        let running = Dictionary(uniqueKeysWithValues: disks.compactMap { r in r.progress.map { (r.id, $0) } })
+        let running = Dictionary(uniqueKeysWithValues: disks.compactMap { r in r.progress.map { (r.id, ($0, r.scanStart)) } })
         disks = allDisks().map { d in
             let info = indexInfo(d)
             let cap = try? d.root.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey])
             let fill = cap?.volumeTotalCapacity.flatMap { total in
                 cap?.volumeAvailableCapacity.map { total > 0 ? 1 - Double($0) / Double(total) : 0 }
             }
-            return DiskRow(disk: d, count: info?.count, date: info?.date, progress: running[d.key], fill: fill)
+            return DiskRow(disk: d, count: info?.count, date: info?.date, progress: running[d.key]?.0, scanStart: running[d.key]?.1, fill: fill)
         }
     }
 
@@ -618,7 +626,9 @@ final class Model: ObservableObject {
     }
 
     private func setProgress(_ key: String, _ n: Int?) {
-        if let i = disks.firstIndex(where: { $0.id == key }) { disks[i].progress = n }
+        guard let i = disks.firstIndex(where: { $0.id == key }) else { return }
+        disks[i].progress = n
+        if n == 0 || n == nil { disks[i].scanStart = n.map { _ in Date() } }
     }
 
     /// Kortet eller disken är en hel volym under /Volumes, inte en vald mapp, och kan matas ut.

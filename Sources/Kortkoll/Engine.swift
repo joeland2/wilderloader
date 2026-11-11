@@ -569,6 +569,7 @@ func runSelfTest() {
     testXXH64()
     testFormats()
     testLeftoverParts()
+    testCopyMemory()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
@@ -687,10 +688,13 @@ func fileHash(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> UInt64 {
     let h = try FileHandle(forReadingFrom: url)
     defer { try? h.close() }
     var hasher = XXH64()
-    while let d = try h.read(upToCount: 8 << 20), !d.isEmpty {
+    // Utan pool ligger varje läst bit kvar i minnet tills hela filen är läst: 19 GB fil gav 19 GB minne.
+    while try autoreleasepool(invoking: { () -> Bool in
+        guard let d = try h.read(upToCount: 8 << 20), !d.isEmpty else { return false }
         hasher.update(d)
         progress?(d.count)
-    }
+        return true
+    }) {}
     return hasher.finalize()
 }
 
@@ -710,7 +714,8 @@ func copyVerified(_ src: URL, to dst: URL) throws {
 
 /// Kopierar till flera ställen samtidigt, med en enda läsning av kortet. Svaret har ett fel eller nil per ställe,
 /// så att en disk som krånglar inte stoppar kopian till den andra.
-func copyVerified(_ src: URL, to dsts: [URL]) -> [Error?] {
+/// `progress`: antal byte som lästs från kortet, medan filen kopieras.
+func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil) -> [Error?] {
     let fm = FileManager.default
     var results = [Error?](repeating: nil, count: dsts.count)
     var work: [(index: Int, part: URL)] = []
@@ -728,7 +733,7 @@ func copyVerified(_ src: URL, to dsts: [URL]) -> [Error?] {
     }
     guard !work.isEmpty else { return results }
 
-    let written = copyStreaming(src, to: work.map(\.part))
+    let written = copyStreaming(src, to: work.map(\.part), progress: progress)
     // Kortet och kopiorna läses samtidigt, eftersom de oftast ligger på olika enheter och väntar på varsin.
     let lock = NSLock()
     var hashes: [Int: Result<UInt64, Error>] = [:]
@@ -780,20 +785,20 @@ private final class CopyWriter {
 
     /// Tömmer kön även efter ett fel, så att läsaren aldrig fastnar.
     func run() {
-        while true {
+        while autoreleasepool(invoking: { () -> Bool in
             ready.wait()
             lock.lock(); let next = queue.removeFirst(); lock.unlock()
             free.signal()
-            guard let d = next else { break }
-            if error != nil { continue }
-            do { try output?.write(contentsOf: d) } catch { fail(error) }
-        }
+            guard let d = next else { return false }
+            if error == nil { do { try output?.write(contentsOf: d) } catch { fail(error) } }
+            return true
+        }) {}
         do { try output?.synchronize(); try output?.close() } catch { fail(error) }
     }
 }
 
 /// Läser källan en gång och skriver till alla kopior samtidigt. Skrivarna har egna trådar, så att de inte kan bli väntande på en ledig plats i en trådpool.
-private func copyStreaming(_ src: URL, to dsts: [URL]) -> [Error?] {
+private func copyStreaming(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)?) -> [Error?] {
     let writers = dsts.map(CopyWriter.init)
     let group = DispatchGroup()
     for w in writers {
@@ -810,8 +815,14 @@ private func copyStreaming(_ src: URL, to dsts: [URL]) -> [Error?] {
         // Varje plats som tas i en kö lämnas tillbaka av skrivaren, och kön avslutas alltid med nil nedan.
         while writers.contains(where: { $0.error == nil }) {
             writers.forEach { $0.waitForRoom() }
-            guard let d = try input.read(upToCount: 8 << 20), !d.isEmpty else { break }
-            writers.forEach { $0.push(d) }
+            // Poolen töms varje varv, annars stannar alla lästa bitar i minnet tills filen är klar.
+            let more = try autoreleasepool { () -> Bool in
+                guard let d = try input.read(upToCount: 8 << 20), !d.isEmpty else { return false }
+                writers.forEach { $0.push(d) }
+                progress?(d.count)
+                return true
+            }
+            if !more { break }
         }
     } catch { readError = error }
     writers.forEach { $0.push(nil) }
@@ -827,6 +838,34 @@ private func copyStreaming(_ src: URL, to dsts: [URL]) -> [Error?] {
             return nil
         } catch { return error }
     }
+}
+
+/// Minnet appen använder just nu.
+private func footprint() -> Int64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) } }
+    return kr == KERN_SUCCESS ? Int64(info.phys_footprint) : 0
+}
+
+/// Stora filer får inte ta lika mycket minne som de är stora. En 19 GB-fil fyllde Macens minne i 0.2.
+private func testCopyMemory() {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("wl-mem-\(UUID().uuidString)")
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: dir) }
+    let src = dir.appendingPathComponent("big.mov")
+    fm.createFile(atPath: src.path, contents: nil)
+    let h = try! FileHandle(forWritingTo: src)
+    for _ in 0..<64 { autoreleasepool { try! h.write(contentsOf: Data(count: 8 << 20)) } }
+    try! h.close()
+    let before = footprint()
+    var seen = 0
+    let r = copyVerified(src, to: [dir.appendingPathComponent("a/big.mov"), dir.appendingPathComponent("b/big.mov")]) { seen += $0 }
+    let grew = footprint() - before
+    assert(r.allSatisfy { $0 == nil }, "\(r)")
+    assert(seen == 512 << 20, "förloppet ska räkna varje byte: \(seen)")
+    assert(grew < 150 << 20, "kopian av 512 MB använde \(grew >> 20) MB minne")
 }
 
 /// Kopian ska bli identisk med samma datum, aldrig skriva över och inte fastna eller lämna en falsk fil när disken blir full.

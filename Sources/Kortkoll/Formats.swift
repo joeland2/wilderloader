@@ -165,8 +165,26 @@ func templatePlace(_ base: URL, _ sub: String) -> URL {
     return want.dropFirst(overlap).reduce(base) { $0.appendingPathComponent($1, isDirectory: true) }
 }
 
+/// Hur långt en skanning har kommit, mätt mot antalet filer förra gången. Tid kvar först när takten går att lita på.
+func scanEstimate(done: Int, last: Int?, elapsed: TimeInterval) -> (fraction: Double, left: TimeInterval?)? {
+    guard let last, last > 0 else { return nil }
+    let fraction = min(0.99, Double(done) / Double(last))
+    // Fler filer än förra gången: slutet går inte att veta, så ingen tid visas.
+    guard done >= 500, elapsed >= 5, done < last else { return (fraction, nil) }
+    return (fraction, elapsed * Double(last - done) / Double(done))
+}
+
+/// "<1 min", "~4 min", "~2 h" kvar.
+func leftLabel(_ s: TimeInterval) -> String {
+    s < 60 ? L("<1 min left", "<1 min kvar") : s < 3600 ? L("~\(Int((s / 60).rounded())) min left", "~\(Int((s / 60).rounded())) min kvar") : L("~\(Int((s / 3600).rounded())) h left", "~\(Int((s / 3600).rounded())) h kvar")
+}
+
 /// Formaten ska räknas, okända filer ska synas och sidofiler ska hitta sina klipp.
 func testFormats() {
+    assert(scanEstimate(done: 100, last: nil, elapsed: 60) == nil, "första skanningen har inget att jämföra med")
+    assert(scanEstimate(done: 10_000, last: 40_000, elapsed: 60).map { $0.fraction == 0.25 && $0.left == 180 } == true, "en fjärdedel på en minut ger tre minuter kvar")
+    assert(scanEstimate(done: 300, last: 40_000, elapsed: 60)?.left == nil, "för tidigt för att gissa tid")
+    assert(scanEstimate(done: 50_000, last: 40_000, elapsed: 60).map { $0.fraction == 0.99 && $0.left == nil } == true, "fler filer än förra gången")
     let raw = URL(fileURLWithPath: "/Volumes/SSD/Coast/01_RAW", isDirectory: true)
     assert(templatePlace(raw, "Coast/01_RAW/Cam A/2026-11-05").path == "/Volumes/SSD/Coast/01_RAW/Cam A/2026-11-05", "valda nivåer ska inte upprepas")
     assert(templatePlace(raw, "Other/01_RAW/Cam A").path == "/Volumes/SSD/Coast/01_RAW/Other/01_RAW/Cam A", "bara början av mallen får hoppas över")
