@@ -2,7 +2,7 @@
 
 A small Mac app for offloading memory cards. It shows which files on a card, disk or folder are already on your other drives or NAS, and where.
 
-![A card with one shoot that isn't backed up yet](docs/missing.png)
+![A card with one shoot that isn't backed up yet: its line ends in a question mark](docs/missing.png)
 
 - See every shoot on the card, with a line to each drive that already has it. Anything that isn't backed up shows up in yellow.
 - Drag a shoot to a drive to copy it. Every copy is checked against the original with xxHash-64.
@@ -23,6 +23,8 @@ No list can cover everything. If a card holds a file WilderLoader doesn't recogn
 ![Everything on the card is on a drive](docs/safe.png)
 
 ![Which folders each date ended up in](docs/map.png)
+
+![Copying to two drives at once with a folder template](docs/two-disks.png)
 
 The screenshots use demo data.
 
