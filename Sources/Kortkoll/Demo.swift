@@ -102,6 +102,18 @@ enum Demo {
         m.items = all.map(foundItem)
         m.checked = all.count
         shot.save(main, "missing", settle: 1)
+        // Kund ifylld: diskarna där kunden legat förut lyser, med en streckad linje dit.
+        m.clientPlaces = [
+            ClientPlace(client: "Nordljus", place: nas.root.appendingPathComponent("Kunder/Nordljus").path, date: Date().addingTimeInterval(-86400 * 14)),
+            ClientPlace(client: "Nordljus", place: ssd.root.appendingPathComponent("Backup/Nordljus").path, date: Date().addingTimeInterval(-86400 * 14)),
+            ClientPlace(client: "Kafé Linné", place: nas.root.appendingPathComponent("Kunder/Kafé Linné").path, date: Date().addingTimeInterval(-86400 * 20)),
+            ClientPlace(client: "Bergström Bygg", place: nas.root.appendingPathComponent("Kunder/Bergström Bygg").path, date: Date().addingTimeInterval(-86400 * 30)),
+        ]
+        shot.save(main, "client-empty", settle: 0.5)
+        m.client = "Nordljus"
+        shot.save(main, "client", settle: 0.5)
+        m.client = ""
+        m.clientPlaces = []
         print("flow frame size", main.bounds.size)
 
         // 3. Väljaren när filerna ska kopieras.
@@ -165,6 +177,7 @@ enum Demo {
         Updater.shared.available = nil
 
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format")
+        shot.sheet(AnyView(HelpGuide().background(Color(white: 0.16)).environment(\.colorScheme, .dark)), "sheet-legend")
         shot.sheet(AnyView(ProPanel().environmentObject(m).background(Color(white: 0.16)).environment(\.colorScheme, .dark)), "sheet-pro")
         // Rapporten, med påhittade kontrollsummor.
         let reportRows = m.items.prefix(40).enumerated().map { k, it in ReportFile(rel: it.file.rel, size: it.file.size, hash: UInt64(k) &* 0x9E3779B97F4A7C15, ok: [true, true]) }

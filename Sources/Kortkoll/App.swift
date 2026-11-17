@@ -130,6 +130,13 @@ final class Model: ObservableObject {
     @Published var minorFiles: [URL] = []
     /// Vad som hänt med kortet tidigare: kopieringar och formateringar.
     @Published var cardHistory: [CardEvent] = []
+    /// Kunden eller projektet. Står kvar till nästa kort, så att ett jobb med flera kort bara skrivs en gång.
+    @Published var client = ""
+    /// Var kunderna har kopierats förut, från kortens historik.
+    @Published var clientPlaces: [ClientPlace] = loadClientPlaces()
+    /// Mapparna på varje disk, från diskens lista. Läses in första gången en kund skrivs.
+    @Published var clientFolders: [String: [String]] = [:]
+    private var foldersLoaded = false
     /// Kön: alla kort som sitter i, och de som redan kopierats och matats ut.
     @Published var cardQueue: [URL] = []
     @Published var doneCards: [DoneCard] = []
@@ -298,6 +305,40 @@ final class Model: ObservableObject {
             }
         }
         return out
+    }
+
+    /// Förslagen för kunden på en disk.
+    /// Sparas per kund, eftersom vyerna frågar många gånger per tangenttryck och en NAS kan ha tiotusentals mappar.
+    func clientSuggestions(on disk: Disk) -> [ClientHit] {
+        let key = "\(client)|\(clientFolders.count)|\(clientPlaces.count)"
+        if hitCache.key != key { hitCache = (key, [:]) }
+        if let hit = hitCache.hits[disk.key] { return hit }
+        let hit = clientHits(client, root: disk.root, places: clientPlaces, folders: clientFolders[disk.key] ?? [])
+        hitCache.hits[disk.key] = hit
+        return hit
+    }
+    private var hitCache: (key: String, hits: [String: [ClientHit]]) = ("", [:])
+
+    /// Där väljaren öppnas för kunden: där den legat förut, annars bredvid de andra kunderna med en ny mapp föreslagen.
+    func clientStart(on disk: Disk) -> (URL, String)? {
+        let c = client.trimmingCharacters(in: .whitespaces)
+        guard !c.isEmpty else { return nil }
+        if let hit = clientSuggestions(on: disk).first { return (hit.url, "") }
+        return (clientsHome(root: disk.root, places: clientPlaces) ?? dirURL(disk.root), c)
+    }
+
+    /// Läser mapparna ur diskarnas listor i bakgrunden, en gång.
+    /// shortcut: läses inte om när en disk skannas om; nya mappar kommer med nästa gång appen startar.
+    func loadClientFolders() {
+        guard !foldersLoaded else { return }
+        foldersLoaded = true
+        let disks = copyTargets
+        Task.detached(priority: .utility) { [weak self] in
+            var out: [String: [String]] = [:]
+            for d in disks { out[d.key] = indexedFolders(d) }
+            let done = out
+            await MainActor.run { self?.clientFolders = done }
+        }
     }
 
     /// Mappen där väljaren öppnas: den där kortets filer från samma dagar redan ligger, annars diskens rot.
@@ -546,6 +587,7 @@ final class Model: ObservableObject {
         let log = card.map { historyURL(cardKey($0)) }
         let cardName = card?.lastPathComponent ?? ""
         let places = [folder.standardizedFileURL.path] + (also.map { [$0.standardizedFileURL.path] } ?? [])
+        let client = self.client.trimmingCharacters(in: .whitespaces)
         thumbs = []
         bytesDone = 0
         checkBytes = 0
@@ -634,11 +676,12 @@ final class Model: ObservableObject {
             }
             if let log, okFiles + failedCount > 0 {
                 appendHistory(CardEvent(kind: .copy, files: okFiles, bytes: okBytes, places: places, failed: failedCount,
-                                        reports: reports.isEmpty ? nil : reports.map(\.path)), to: log)
+                                        reports: reports.isEmpty ? nil : reports.map(\.path), client: client.isEmpty ? nil : client), to: log)
             }
             await MainActor.run {
                 guard let self else { return }
                 if let log { self.cardHistory = loadHistory(log) }
+                if !client.isEmpty, okFiles > 0 { self.clientPlaces += places.map { ClientPlace(client: client, place: $0, date: Date()) } }
                 self.busy = false
                 self.copyingTo = nil
                 self.copyingAlso = nil

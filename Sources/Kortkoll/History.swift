@@ -17,6 +17,8 @@ struct CardEvent: Codable, Equatable {
     var failed = 0
     /// Rapporterna som sparades bredvid kopian.
     var reports: [String]? = nil
+    /// Kunden eller projektet som skrevs på kortet.
+    var client: String? = nil
 }
 
 /// Volymens id för ett kort, annars mappens sökväg (när en vanlig mapp kontrolleras).

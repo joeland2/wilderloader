@@ -257,6 +257,7 @@ struct ContentView: View {
             let dirs = Set(m.items.map { ($0.file.rel as NSString).deletingLastPathComponent }).filter { !$0.isEmpty }
             let place = dirs.count == 1 ? (dirs.first! as NSString).lastPathComponent : dirs.isEmpty ? L("The card", "Kortet") : L("\(dirs.count) folders", "\(dirs.count) mappar")
             let ring = !m.failed.isEmpty ? fail : !m.missing.isEmpty ? miss : m.busy ? mute : ok
+            VStack(spacing: 0) {
             HStack(spacing: 14) {
                 Image(systemName: m.disks.contains { $0.disk.root.standardizedFileURL.path == card.standardizedFileURL.path } ? "externaldrive" : "sdcard")
                     .font(.system(size: 24, weight: .light))
@@ -277,10 +278,13 @@ struct ContentView: View {
                 }
             }
             .padding(.horizontal, 18)
-            .frame(width: 400, height: 68)
+            .frame(height: 68)
             .contentShape(Rectangle())
             .onTapGesture { NSWorkspace.shared.open(card) }
             .help(L("Open \(card.lastPathComponent) in Finder", "Öppna \(card.lastPathComponent) i Finder"))
+            ClientField()
+            }
+            .frame(width: 400, height: 108)
             .background(RoundedRectangle(cornerRadius: 4).fill(cardFill))
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(ring.opacity(0.7), lineWidth: 1.2))
         } else {
@@ -540,6 +544,7 @@ struct Flow<Card: View>: View {
     @State private var copyAfterMap: Disk?
     @State private var retracting = false
     @State private var missingDetail: Tile?
+    @State private var legend = false
     /// Nollställs av systemet även när ett drag avbryts, till exempel av ett högerklick, då onEnded aldrig körs.
     @GestureState private var liveDrag = false
 
@@ -550,9 +555,11 @@ struct Flow<Card: View>: View {
         let disk: Disk
         let extra: Bool
         let start: URL
+        var newFolder = ""
     }
 
-    private let cardH: CGFloat = 68, tileH: CGFloat = 112, gap: CGFloat = 12, cableH: CGFloat = 70
+    private var cardH: CGFloat { m.card != nil ? 108 : 68 }
+    private let tileH: CGFloat = 112, gap: CGFloat = 12, cableH: CGFloat = 70
     /// Luckan under kortet, själva fotograferingen och utrymmet ner till porten.
     private let shootGap: CGFloat = 16, shootBody: CGFloat = 98, shootH: CGFloat = 16 + 98 + 12
 
@@ -588,6 +595,11 @@ struct Flow<Card: View>: View {
             let routes = linkList().flatMap { l in sources(of: l, in: shown).map { ($0, l) } }
             // Fotograferingar med filer som bara finns på kortet: linjen hänger fritt och slutar i ett frågetecken.
             let asking = ports ? shown.indices.filter { k in m.items(in: shown[k]).contains { $0.status == .missing } } : []
+            // Diskar där kunden har legat förut: en streckad linje dit, som ett förslag.
+            // Bara när något saknas: annars finns inget att dra, och linjerna skulle bara skymma.
+            let hinted = m.client.isEmpty || dragShoot != nil || m.missing.isEmpty ? [] : tiles.indices.filter { i in
+                tiles[i].kind == .disk && tiles[i].row.map { !$0.disk.offline && !m.clientSuggestions(on: $0.disk).isEmpty } == true
+            }
             let askAt = { (k: Int) in CGPoint(x: shootX(k) + min(44, shootW * 0.35), y: shootY + min(96, (tileTop - shootY) * 0.4)) }
 
             ZStack(alignment: .topLeading) {
@@ -602,6 +614,14 @@ struct Flow<Card: View>: View {
                             let backup = m.copyingTo != nil
                             ctx.stroke(path, with: .color(backup ? mute.opacity(0.5) : miss), style: StrokeStyle(lineWidth: backup ? 1.2 : 2, lineCap: .round, dash: backup ? [2, 4] : [6, 5]))
                         }
+                        // Från fotograferingarna som saknas, till diskarna där kunden brukar ligga.
+                        for i in hinted { for k in asking where m.copyingTo == nil {
+                            let a = CGPoint(x: shootX(k), y: shootY), b = CGPoint(x: tileX(i), y: tileTop)
+                            var path = Path()
+                            path.move(to: a)
+                            path.addCurve(to: b, control1: CGPoint(x: a.x, y: (a.y + b.y) / 2), control2: CGPoint(x: b.x, y: (a.y + b.y) / 2))
+                            ctx.stroke(path, with: .color(accent.opacity(0.8)), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [4, 5]))
+                        } }
                         for (k, l) in routes {
                             let a = CGPoint(x: shown.isEmpty ? w / 2 : shootX(k), y: shootY)
                             let b = CGPoint(x: tileX(l.tile) + (l.kind == .copying ? 18 : 0), y: tileTop)
@@ -642,8 +662,15 @@ struct Flow<Card: View>: View {
                         .position(x: shootX(k), y: cardH + shootGap + shootBody / 2)
                 }
 
-                Text(L("OUT", "UT")).font(display(15)).tracking(1.5).foregroundStyle(mute)
-                    .offset(y: tileTop - 24)
+                HStack(spacing: 10) {
+                    Text(L("OUT", "UT")).font(display(15)).tracking(1.5).foregroundStyle(mute)
+                    Button { legend = true } label: {
+                        Label(L("What the lines mean", "Vad linjerna betyder"), systemImage: "info.circle").font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain).foregroundStyle(mute)
+                    .popover(isPresented: $legend) { HelpGuide() }
+                }
+                .offset(y: tileTop - 24)
 
                 ForEach(Array(tiles.enumerated()), id: \.element.id) { i, t in
                     TileView(tile: t)
@@ -857,7 +884,7 @@ struct Flow<Card: View>: View {
             }
             .sheet(item: $missingDetail) { t in TileDetail(tile: t).environmentObject(m) }
             .sheet(item: $shootCopy) { c in
-                LandingSheet(files: c.files, disk: c.disk, start: c.start, extra: c.extra, anyStatus: true).environmentObject(m)
+                LandingSheet(files: c.files, disk: c.disk, start: c.start, extra: c.extra, anyStatus: true, newFolder: c.newFolder).environmentObject(m)
             }
         }
         .frame(minHeight: cardH + shootH + tileH + 120 + cableH)
@@ -886,10 +913,13 @@ struct Flow<Card: View>: View {
             if case .copied(let u) = it.status, on(u) { return false }
             return !it.copies.contains(where: on)
         }
-        return ShootCopy(files: (away.isEmpty ? items : away).map(\.file), disk: disk, extra: away.isEmpty,
-                         // Finns allt redan där öppnas väljaren där filerna ligger, så att du ser platsen.
-                         start: away.isEmpty ? m.homes(of: items.map(\.file), on: disk).max { $0.value < $1.value }?.key ?? disk.root
-                                             : m.likelyFolder(for: items.map(\.file), on: disk))
+        // Finns allt redan där öppnas väljaren där filerna ligger, så att du ser platsen.
+        if away.isEmpty {
+            return ShootCopy(files: items.map(\.file), disk: disk, extra: true,
+                             start: m.homes(of: items.map(\.file), on: disk).max { $0.value < $1.value }?.key ?? disk.root)
+        }
+        let (start, newFolder) = m.clientStart(on: disk) ?? (m.likelyFolder(for: items.map(\.file), on: disk), "")
+        return ShootCopy(files: away.map(\.file), disk: disk, extra: false, start: start, newFolder: newFolder)
     }
 
     private struct Link { let tile: Int; let kind: LinkKind }
@@ -995,24 +1025,35 @@ struct HelpGuide: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text(L("How to read WilderLoader", "Så läser du WilderLoader")).font(display(22)).tracking(0.8)
 
+                section(L("The lines", "Linjerna"))
+                row({ line(safe) }, L("The files are there and match.", "Filerna finns där och stämmer."))
+                row({ line(safe.opacity(0.45), dash: [4, 4]) }, L("Found, but still being checked byte by byte (Full check).", "Hittad, men kontrolleras fortfarande byte för byte (Full kontroll)."))
+                row({ line(ok.opacity(0.8), dash: [0.5, 6]) }, L("Only in the list for a disconnected disk. Connect it to check.", "Finns bara i listan för en urkopplad disk. Koppla in den för att kontrollera."))
+                row({ HStack(spacing: 6) { line(miss, dash: [6, 5], width: 70); askMark } },
+                    L("Only on the card. Drag the question mark to a disk to copy, or click it to see the files.", "Finns bara på kortet. Dra frågetecknet till en disk för att kopiera, eller klicka för att se filerna."))
+                row({ line(accent.opacity(0.8), dash: [4, 5], thin: true) },
+                    L("A suggestion: where the client you typed on the card went before. The disk turns yellow and shows the folder.", "Ett förslag: där kunden du skrev på kortet har hamnat förut. Disken blir gul och visar mappen."))
+                row({ line(copy, dash: [8, 6]) }, L("Being copied now.", "Kopieras nu."))
+                row({ HStack(spacing: 6) { line(mute.opacity(0.5), dash: [2, 4], width: 70, thin: true); Circle().stroke(mute, lineWidth: 1.5).frame(width: 11, height: 11) } },
+                    L("While copying: drag the small dot to another disk for a backup. It starts when the first copy is done.", "Under kopieringen: dra den lilla pricken till en annan disk för en backup. Den startar när första kopian är klar."))
+                row({ line(fail, dash: [6, 5]) }, L("Couldn't be copied. See the message at the bottom.", "Kunde inte kopieras. Se meddelandet längst ner."))
+                row({ line(idle, dash: [2, 5]) }, L("Nothing from the card on that disk.", "Inget från kortet på den disken."))
+                row({ cableSample }, L("Under the disks: drag from one disk's dot to another to copy its files there too.", "Under diskarna: dra från en disks prick till en annan för att lägga filerna där också."))
+
+                section(L("The card", "Kortet"))
+                row({ HStack(spacing: 5) { Image(systemName: "person.crop.square").foregroundStyle(miss); Text("Nordljus").font(.system(size: 12, weight: .medium)) } },
+                    L("Client or project. Optional: the disks show where it went before, and the next card keeps it.", "Kund eller projekt. Valfritt: diskarna visar var det hamnat förut, och nästa kort behåller det."))
+
                 section(L("The disk tiles", "Diskrutorna"))
                 row({ Text(L("41,325 files · 29 min", "41 325 filer · 29 min")).font(.system(size: 11)).monospacedDigit() },
                     L("How many photos and videos WilderLoader has listed for the disk, and how long ago it was scanned.", "Så många bilder och filmer WilderLoader har i listan för disken, och hur länge sedan den skannades."))
                 row({ gauge(0.86) }, L("How full the disk is, in steps of 10 %. The last two turn yellow above 80 %.", "Hur full disken är, i steg om 10 %. De två sista blir gula över 80 %."))
                 row({ Text("45").font(.system(size: 11, weight: .bold)).foregroundStyle(onOk).padding(.horizontal, 8).padding(.vertical, 3).background(Capsule().fill(ok)) },
                     L("How many of the card's files are already on the disk. Click the tile to see them.", "Så många av kortets filer som redan finns på disken. Klicka på rutan för att se dem."))
-                row({ HStack(spacing: 6) { Circle().fill(miss).frame(width: 7); Circle().fill(copy).frame(width: 7) } },
-                    L("Yellow dot: the disk isn't scanned yet. A purple ring: it's being scanned now, and you can keep working meanwhile.", "Gul prick: disken är inte skannad än. Lila ring: den skannas nu, och du kan jobba på under tiden."))
+                row({ Circle().fill(miss).frame(width: 7) },
+                    L("Yellow dot: the disk isn't scanned yet. A ring instead of the icon: it's being scanned now, and you can keep working meanwhile.", "Gul prick: disken är inte skannad än. En ring i stället för ikonen: den skannas nu, och du kan jobba på under tiden."))
                 row({ Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold)) },
                     L("Rescan just that disk. Shows when the pointer is over the tile, or right-click.", "Skanna om bara den disken. Syns när muspekaren är över rutan, eller högerklicka."))
-
-                section(L("The lines", "Linjerna"))
-                row({ line(ok) }, L("The files are there and match.", "Filerna finns där och stämmer."))
-                row({ line(ok.opacity(0.45), dash: [4, 4]) }, L("Found, but still being checked byte by byte (Full check).", "Hittad, men kontrolleras fortfarande byte för byte (Full kontroll)."))
-                row({ line(ok.opacity(0.8), dash: [0.5, 6]) }, L("Only in the list for a disconnected disk. Connect it to check.", "Finns bara i listan för en urkopplad disk. Koppla in den för att kontrollera."))
-                row({ line(miss, dash: [6, 5]) }, L("Only on the card. Copy before you format.", "Finns bara på kortet. Kopiera innan du formaterar."))
-                row({ line(copy, dash: [8, 6]) }, L("Being copied now.", "Kopieras nu."))
-                row({ line(idle, dash: [2, 5]) }, L("Nothing from the card on that disk.", "Inget från kortet på den disken."))
 
                 section(L("Why does WilderLoader scan?", "Varför skannar WilderLoader?"))
                 Text(L("Searching every disk each time takes long. So WilderLoader lists every photo and video on each disk once: seconds for a normal disk, a few minutes for a NAS. After that every check takes seconds. The lists update when a disk is connected and when you copy files. A list is only used to find candidates; the real file is always compared before it counts.", "Att leta igenom alla diskar varje gång tar lång tid. Därför gör WilderLoader en lista över alla bilder och filmer på varje disk, en gång: sekunder för en vanlig disk, några minuter för en NAS. Sedan går varje koll på några sekunder. Listorna uppdateras när en disk kopplas in och när du kopierar filer. Listan används bara för att hitta kandidater; den riktiga filen jämförs alltid innan den räknas."))
@@ -1020,7 +1061,7 @@ struct HelpGuide: View {
             }
             .padding(18)
         }
-        .frame(width: 400, height: 520)
+        .frame(width: 420, height: 560)
     }
 
     private func section(_ t: String) -> some View {
@@ -1043,10 +1084,24 @@ struct HelpGuide: View {
         .frame(width: 100, height: 5)
     }
 
-    private func line(_ c: Color, dash: [CGFloat] = []) -> some View {
-        Path { p in p.move(to: CGPoint(x: 0, y: 4)); p.addLine(to: CGPoint(x: 100, y: 4)) }
-            .stroke(c, style: StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: dash))
-            .frame(width: 100, height: 8)
+    private func line(_ c: Color, dash: [CGFloat] = [], width: CGFloat = 100, thin: Bool = false) -> some View {
+        Path { p in p.move(to: CGPoint(x: 0, y: 4)); p.addLine(to: CGPoint(x: width, y: 4)) }
+            .stroke(c, style: StrokeStyle(lineWidth: thin ? 1.5 : 2.5, lineCap: .round, dash: dash))
+            .frame(width: width, height: 8)
+    }
+
+    private var askMark: some View {
+        Text("?").font(.system(size: 10, weight: .bold)).foregroundStyle(miss)
+            .frame(width: 18, height: 18).overlay(Circle().stroke(miss, lineWidth: 1.5))
+    }
+
+    /// Kabeln mellan två diskar, böjd nedåt som i huvudvyn.
+    private var cableSample: some View {
+        Path { p in
+            p.move(to: CGPoint(x: 6, y: 2)); p.addCurve(to: CGPoint(x: 94, y: 2), control1: CGPoint(x: 6, y: 22), control2: CGPoint(x: 94, y: 22))
+        }
+        .stroke(accent, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+        .frame(width: 100, height: 20)
     }
 }
 
@@ -1160,7 +1215,17 @@ struct TileView: View {
             Text(detail).font(.system(size: 11, weight: badge > 0 ? .semibold : .regular)).monospacedDigit()
                 .foregroundStyle(badge > 0 && accent != nil ? accent! : tile.row.map { $0.count == nil } == true ? miss : mute)
                 .lineLimit(1).padding(.top, 2)
-            if tile.kind == .disk {
+            if let hit = clientHit, let root = disk.map({ dirURL($0.root).path }) {
+                // Där kunden har legat förut. Ersätter nivåmätaren medan en kund är ifylld.
+                let rel = hit.url.path == root ? tile.name : String(hit.url.path.dropFirst(root.count + 1))
+                HStack(spacing: 4) {
+                    Image(systemName: hit.cards > 0 ? "clock.arrow.circlepath" : "folder").font(.system(size: 9, weight: .semibold))
+                    Text(rel).font(.system(size: 10.5, design: .monospaced)).lineLimit(1).truncationMode(.head)
+                }
+                .foregroundStyle(miss).padding(.top, 6)
+                .help(hit.cards > 0 ? L("\(m.client) went here \(hit.cards) \(hit.cards == 1 ? "time" : "times") before", "\(m.client) har hamnat här \(hit.cards) \(hit.cards == 1 ? "gång" : "gånger") förut")
+                                    : L("A folder with the name \(m.client)", "En mapp med namnet \(m.client)"))
+            } else if tile.kind == .disk {
                 // Nivåmätare i tio steg; de två sista blir gula när disken nästan är full.
                 let lit = Int(((tile.row?.fill ?? 0) * 10).rounded())
                 HStack(spacing: 2) {
@@ -1174,8 +1239,8 @@ struct TileView: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 4).fill(tile.kind == .missing ? miss.opacity(0.05) : panel))
-        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(accent ?? panelLine, style: .init(lineWidth: accent == nil ? 1 : 1.5, dash: tile.kind == .disk ? [] : [5, 4])))
-        .opacity(tile.row?.disk.offline == true ? 0.6 : accent == nil && tile.kind == .disk ? 0.75 : 1)
+        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(accent ?? (clientHit != nil ? miss.opacity(0.7) : panelLine), style: .init(lineWidth: accent == nil && clientHit == nil ? 1 : 1.5, dash: tile.kind == .disk ? [] : [5, 4])))
+        .opacity(tile.row?.disk.offline == true ? 0.6 : accent == nil && clientHit == nil && tile.kind == .disk ? 0.75 : 1)
         .contentShape(Rectangle())
         .onTapGesture {
             if tile.urls.isEmpty { openInFinder() }
@@ -1204,6 +1269,11 @@ struct TileView: View {
             if let f = r.fill { parts.append(L("The disk is \(Int(f * 100)) % full", "Disken är \(Int(f * 100)) % full")) }
         }
         return parts.joined(separator: " · ")
+    }
+
+    private var clientHit: ClientHit? {
+        guard let disk, !disk.offline, !m.client.isEmpty else { return nil }
+        return m.clientSuggestions(on: disk).first
     }
 
     private var scanDot: Color? {
@@ -1786,7 +1856,8 @@ struct CopyChooser: View {
     var body: some View {
         Group { content }
             .onAppear {
-                suggestion = m.likelyDisk(for: files).map { ($0, m.likelyFolder(for: files, on: $0)) }
+                suggestion = m.copyTargets.lazy.compactMap { d in m.clientSuggestions(on: d).first.map { (d, $0.url) } }.first
+                    ?? m.likelyDisk(for: files).map { ($0, m.likelyFolder(for: files, on: $0)) }
             }
     }
 
@@ -1830,7 +1901,8 @@ struct LandingSheet: View {
     @State private var second: Disk?
     @State private var secondFolder: URL?
 
-    init(files: [CardFile], disk: Disk, start: URL, extra: Bool = false, anyStatus: Bool = false, canChangeDisk: Bool = false, second: Disk? = nil, secondFolder: URL? = nil, onStart: @escaping () -> Void = {}) {
+    init(files: [CardFile], disk: Disk, start: URL, extra: Bool = false, anyStatus: Bool = false, canChangeDisk: Bool = false, second: Disk? = nil, secondFolder: URL? = nil, newFolder: String = "", onStart: @escaping () -> Void = {}) {
+        _newName = State(initialValue: newFolder)
         _second = State(initialValue: second)
         _secondFolder = State(initialValue: secondFolder)
         days = Set(files.map { dayString($0.date) }).sorted()
@@ -2015,6 +2087,7 @@ struct LandingSheet: View {
         .foregroundStyle(fg)
         .task(id: folder) { await load() }
         .task(id: disk.key) { homes = m.homes(of: files, on: disk) }
+        .onAppear { if !m.client.isEmpty { project = m.client } }
     }
 
     /// De tre sista nivåerna; djupare mappar skjuter de översta åt sidan, som i Finder.
@@ -2673,5 +2746,41 @@ struct UpdateSheet: View {
         .frame(width: 480)
         .foregroundStyle(fg)
         .background(bg)
+    }
+}
+
+/// Kund eller projekt, på kortet. Valfritt: utan det drar man linjer som vanligt.
+struct ClientField: View {
+    @EnvironmentObject var m: Model
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let recent = recentClients(m.clientPlaces, max: 2).filter { $0.lowercased() != m.client.lowercased() }
+        HStack(spacing: 8) {
+            Image(systemName: "person.crop.square").font(.system(size: 13)).foregroundStyle(m.client.isEmpty ? mute : miss)
+            TextField(L("Client or project", "Kund eller projekt"), text: $m.client)
+                .textFieldStyle(.plain).font(.system(size: 13, weight: .medium))
+                .frame(minWidth: 140)
+                .focused($focused)
+                .onChange(of: m.client) { if !m.client.isEmpty { m.loadClientFolders() } }
+            if m.client.isEmpty {
+                ForEach(recent, id: \.self) { c in
+                    Button { m.client = c } label: {
+                        Text(c).font(.system(size: 11)).lineLimit(1).foregroundStyle(mute)
+                            .padding(.horizontal, 8).padding(.vertical, 2)
+                            .overlay(Capsule().stroke(panelLine))
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Recent client", "Senaste kund"))
+                }
+            } else {
+                Button { m.client = ""; focused = true } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 12)) }
+                    .buttonStyle(.plain).foregroundStyle(mute)
+                    .help(L("Clear", "Rensa")).accessibilityLabel(L("Clear client", "Rensa kund"))
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 40)
+        .overlay(alignment: .top) { Rectangle().fill(m.client.isEmpty ? cardLine : miss.opacity(0.5)).frame(height: 1) }
     }
 }

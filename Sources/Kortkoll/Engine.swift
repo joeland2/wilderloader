@@ -608,6 +608,7 @@ func runSelfTest() {
     testResume()
     testMHL()
     testUpdate()
+    testClients()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
