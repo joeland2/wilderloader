@@ -141,6 +141,14 @@ enum Demo {
             m.bytesDone = doneBytes
             m.checkBytes = doneBytes
             shot.save(main, String(format: "copy-%02d", f), settle: 0.125, jpeg: true)
+            if f == 14 {
+                // Kön: ett kort klart, det här kopieras, två väntar.
+                m.doneCards = [DoneCard(key: "a", name: "A001 Cam A", files: 412)]
+                m.cardQueue = [card, base.appendingPathComponent("B002 Cam B"), base.appendingPathComponent("ZOOM F6")]
+                shot.save(main, "queue", settle: 0.5)
+                m.doneCards = []
+                m.cardQueue = []
+            }
         }
 
         // 6. Allt finns: säkert att formatera.
@@ -152,6 +160,36 @@ enum Demo {
         shot.save(main, "safe", settle: 1)
 
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format")
+        shot.sheet(AnyView(ProPanel().environmentObject(m).background(Color(white: 0.16)).environment(\.colorScheme, .dark)), "sheet-pro")
+        // Rapporten, med påhittade kontrollsummor.
+        let reportRows = m.items.prefix(40).enumerated().map { k, it in ReportFile(rel: it.file.rel, size: it.file.size, hash: UInt64(k) &* 0x9E3779B97F4A7C15, ok: [true, true]) }
+        let pics = (0..<6).compactMap { NSImage(data: picture($0))?.jpeg() }
+        writeReport(reportHTML(card: "LUMIX", date: Date(), places: [coast.path, camA.path], files: Array(reportRows), thumbs: pics, version: "0.3 beta"), card: "LUMIX", date: Date(), to: [out])
+
+        // Andra filer: en egen grupp sist, med frågetecken, och stapeln över allt på kortet. Historiken utfälld.
+        let safeItems = m.items, safeShoots = m.shoots
+        let extras = ["NOTES/shotlist.txt", "LUT/coast_v2.cube", "A001.XYZ"].enumerated().map { k, rel in
+            Item(file: CardFile(url: card.appendingPathComponent(rel), rel: rel, size: [4_000, 1_000_000, 2_100_000_000][k], date: Date(), other: true), status: .missing)
+        }
+        m.items = safeItems + extras
+        m.shoots = safeShoots + [Array(safeItems.count..<m.items.count)]
+        m.minorFiles = (1...10).map { card.appendingPathComponent("MISC/M\($0).XML") }
+        let day = { (d: Int, h: Int) in Calendar.current.date(from: DateComponents(year: 2026, month: 10, day: d, hour: h))! }
+        m.cardHistory = [
+            CardEvent(date: day(11, 18), kind: .format),
+            CardEvent(date: day(12, 20), kind: .copy, files: 476, bytes: 52_000_000_000, places: [camA.path]),
+            CardEvent(date: day(13, 19), kind: .copy, files: 112, bytes: 3_100_000_000, places: [nas.root.appendingPathComponent("2026/Studio Portraits/RAW").path, ssd.root.appendingPathComponent("Projects/Studio Portraits").path]),
+            CardEvent(date: Date().addingTimeInterval(-600), kind: .copy, files: 652, bytes: 89_000_000_000, places: [target.path]),
+        ]
+        assert(!m.formatReady, "andra filer som inte är kopierade ska spärra")
+        let wasOpen = UserDefaults.standard.object(forKey: "historyOpen")
+        UserDefaults.standard.set(true, forKey: "historyOpen")
+        shot.save(main, "all-files", settle: 1)
+        UserDefaults.standard.set(wasOpen, forKey: "historyOpen")
+        m.items = safeItems
+        m.shoots = safeShoots
+        m.minorFiles = []
+        m.cardHistory = []
 
         // Allt finns, men en del bara i listan för en urkopplad disk och en del bara efter snabbkollen. Formatering ska då inte erbjudas utan varning.
         assert(m.formatReady && m.unverified == 0, "kontrollerade filer ska kunna formateras")
@@ -170,7 +208,7 @@ enum Demo {
         // Filer appen inte kan kontrollera får aldrig raderas i tysthet, även om allt annat är klart.
         assert(m.formatReady, "allt kontrollerat")
         m.otherFiles = [card.appendingPathComponent("A001.XYZ"), card.appendingPathComponent("A002.XYZ")]
-        m.minorFiles = 12
+        m.minorFiles = (1...12).map { card.appendingPathComponent("M\($0).XML") }
         assert(!m.formatReady, "okända filer ska spärra")
         shot.save(main, "other-files", settle: 1)
         // Skanning: NAS:en mäts mot förra listan, MM 2 skannas för första gången.
@@ -181,7 +219,7 @@ enum Demo {
         m.disks = rows
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format-other")
         m.otherFiles = []
-        m.minorFiles = 0
+        m.minorFiles = []
 
         // Kartan från pluppen. Saknade filer ingår inte, och en fotografering kan ligga i flera mappar.
         let map = m.diskMap(nas.root)

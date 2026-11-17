@@ -9,6 +9,8 @@ struct CardFile {
     let size: Int64
     /// Senast ändrad på kortet, vilket för kamerafiler är inspelningstiden.
     let date: Date
+    /// Ingen inspelning, t.ex. en textfil eller en okänd filtyp. Visas i en egen grupp och kopieras med kortets mappar.
+    var other = false
 }
 
 /// "2026-11-02" i lokal tid, för datummapparna.
@@ -558,6 +560,22 @@ func copyHistory(_ files: [CardFile], logs: [(URL, Bool)] = [(copyLogURL(), true
     return out
 }
 
+/// Kopior som appen själv har gjort, på namn och storlek. Diskarnas listor har bara inspelningar,
+/// så andra filer hittas på det här sättet. Kopior gjorda i Finder hittas inte, vilket är säkert håll: de visas som saknade.
+func loggedCopies(_ files: [CardFile], log: URL = copyLogURL()) -> [String: [URL]] {
+    let wanted = Set(files.map(discardKey))
+    var out: [String: [URL]] = [:]
+    guard !wanted.isEmpty, let text = try? String(contentsOf: log, encoding: .utf8) else { return out }
+    for line in text.split(separator: "\n") {
+        let parts = line.split(separator: "\t", maxSplits: 2)
+        guard parts.count == 3 else { continue }
+        let dest = URL(fileURLWithPath: String(parts[2]))
+        guard wanted.contains("\(dest.lastPathComponent)\t\(parts[1])"), !(out[dest.lastPathComponent] ?? []).contains(dest) else { continue }
+        out[dest.lastPathComponent, default: []].append(dest)
+    }
+    return out
+}
+
 // MARK: Rensade
 // Filer du själv har sagt att du har rensat bort, en rad per fil: "<namn>\t<storlek>".
 // Så räknas de som hanterade även nästa gång kortet sitter i.
@@ -585,6 +603,8 @@ func runSelfTest() {
     testLeftoverParts()
     testCopyMemory()
     testScanPause()
+    testHistory()
+    testReport()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
@@ -703,6 +723,8 @@ func verifyBackup(of file: CardFile, among candidates: [URL], progress: ((Int) -
 func fileHash(_ url: URL, progress: ((Int) -> Void)? = nil) throws -> UInt64 {
     let h = try FileHandle(forReadingFrom: url)
     defer { try? h.close() }
+    // Läs från disken, inte från datorns minne: kontrollen ska se det som faktiskt ligger på kortet och på kopian.
+    _ = fcntl(h.fileDescriptor, F_NOCACHE, 1)
     var hasher = XXH64()
     // Utan pool ligger varje läst bit kvar i minnet tills hela filen är läst: 19 GB fil gav 19 GB minne.
     while try autoreleasepool(invoking: { () -> Bool in
@@ -731,7 +753,8 @@ func copyVerified(_ src: URL, to dst: URL) throws {
 /// Kopierar till flera ställen samtidigt, med en enda läsning av kortet. Svaret har ett fel eller nil per ställe,
 /// så att en disk som krånglar inte stoppar kopian till den andra.
 /// `progress`: antal byte som lästs från kortet, medan filen kopieras. `checked`: byte av kortets fil som kontrollerats efteråt.
-func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, checked: ((Int) -> Void)? = nil) -> [Error?] {
+/// `hashed`: kortfilens xxHash-64 från kontrollen, till rapporten.
+func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, checked: ((Int) -> Void)? = nil, hashed: ((UInt64) -> Void)? = nil) -> [Error?] {
     let fm = FileManager.default
     var results = [Error?](repeating: nil, count: dsts.count)
     var work: [(index: Int, part: URL)] = []
@@ -758,6 +781,7 @@ func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, 
         let r = Result { try fileHash(k == 0 ? src : work[k - 1].part, progress: k == 0 ? checked : nil) }
         lock.lock(); hashes[k] = r; lock.unlock()
     }
+    if case .success(let h)? = hashes[0] { hashed?(h) }
     for (k, w) in work.enumerated() {
         do {
             if let e = written[k] { throw e }

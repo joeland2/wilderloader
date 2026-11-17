@@ -124,9 +124,26 @@ final class Model: ObservableObject {
     @Published var copyingTo: URL?
     /// Andra disken när filerna kopieras till två ställen samtidigt.
     @Published var copyingAlso: URL?
-    /// Filer på kortet som appen inte kan kontrollera, och de små register- och sidofilerna.
+    /// Paket på kortet som appen inte kan kopiera, och de små register- och sidofilerna.
     @Published var otherFiles: [URL] = []
-    @Published var minorFiles = 0
+    @Published var minorFiles: [URL] = []
+    /// Vad som hänt med kortet tidigare: kopieringar och formateringar.
+    @Published var cardHistory: [CardEvent] = []
+    /// Kön: alla kort som sitter i, och de som redan kopierats och matats ut.
+    @Published var cardQueue: [URL] = []
+    @Published var doneCards: [DoneCard] = []
+    /// Senaste kopieringens mål och mall, som nästa kort får med "Samma plats för nästa kort".
+    private var plan: (folder: URL, also: URL?, subfolder: (CardFile) -> String)?
+    /// Kort som sitter i och inte är klara, utom det som visas.
+    var waitingCards: [URL] {
+        let done = Set(doneCards.map(\.key))
+        return cardQueue.filter { $0 != card && !done.contains(cardKey($0)) }
+    }
+    /// Kopieringar som dragits medan en annan pågick. De körs en i taget, i den ordning de drogs.
+    private var queuedCopies: [() -> Void] = []
+    @Published var queuedTargets: [URL] = []
+    /// Kopiera det som saknas så fort kollen av kortet är klar.
+    private var copyAfterScan = false
     /// Klippens sidofiler. Följer med när klippet kopieras.
     var sidecars: [URL: [URL]] = [:]
     /// Full kontroll jämför allt byte för byte. Annars räcker namn, storlek och stickprov, vilket tar sekunder.
@@ -169,6 +186,8 @@ final class Model: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 let before = self.card
+                if self.cardQueue.isEmpty { self.doneCards = [] }
+                self.cardQueue = mountedCards()
                 self.lookForCard(); self.refreshDisks(); self.autoIndex()
                 // En annan disk kopplades in: kolla kortet igen mot den, så att man kan byta diskar i en och samma port.
                 if let card = self.card, card == before { self.recheck() }
@@ -176,6 +195,7 @@ final class Model: ObservableObject {
         }
         nc.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
+                self?.cardQueue = mountedCards()
                 self?.refreshDisks()
                 guard let self, let card = self.card, !FileManager.default.fileExists(atPath: card.path) else { return }
                 self.task?.cancel()
@@ -187,6 +207,7 @@ final class Model: ObservableObject {
         }
         refreshDisks()
         autoIndex()
+        cardQueue = mountedCards()
         // `--card <mapp>` öppnar en mapp som kort direkt, för test.
         if let i = CommandLine.arguments.firstIndex(of: "--card"), i + 1 < CommandLine.arguments.count {
             scan(URL(fileURLWithPath: CommandLine.arguments[i + 1]))
@@ -308,8 +329,11 @@ final class Model: ObservableObject {
         copyingTo = nil
         copyingAlso = nil
         otherFiles = []
-        minorFiles = 0
+        minorFiles = []
         sidecars = [:]
+        queuedCopies = []
+        queuedTargets = []
+        cardHistory = loadHistory(historyURL(cardKey(root)))
         busy = true
         bytesDone = 0
         bytesTotal = 0
@@ -322,10 +346,15 @@ final class Model: ObservableObject {
                 self.minorFiles = contents.minor
                 self.sidecars = contents.sidecars
                 self.items = files.map { Item(file: $0) }
-                self.shoots = shootGroups(files.map(\.date))
+                // Andra filer ligger sist och blir en egen grupp, oavsett datum.
+                let k = files.firstIndex(where: \.other) ?? files.count
+                self.shoots = shootGroups(files[..<k].map(\.date)) + (k < files.count ? [Array(k..<files.count)] : [])
             }
             // Steg 1: namn, storlek och stickprov. Kartan ritas på sekunder, med svaga linjer tills allt är jämfört.
-            let cands = candidates(of: files)
+            var cands = candidates(of: files)
+            for (name, urls) in loggedCopies(files) {
+                for u in urls where !(cands[name] ?? []).contains(where: { $0.standardizedFileURL == u.standardizedFileURL }) { cands[name, default: []].append(u) }
+            }
             // shortcut: om en annan disk med samma namn sitter i på samma plats räknas filerna där som inkopplade; namnet avgör.
             let offline = offlineDisks(mounted: indexableDisks()).map { $0.root.standardizedFileURL.path + "/" }
             let isOffline = { (u: URL) in let p = u.standardizedFileURL.path; return offline.contains { p.hasPrefix($0) } }
@@ -398,17 +427,42 @@ final class Model: ObservableObject {
                     self.checked += 1
                 }
             }
-            await MainActor.run { self?.busy = false }
+            await MainActor.run { self?.busy = false; self?.scanFinished() }
         }
+    }
+
+    /// Med "Samma plats för nästa kort": kopiera det nya kortets saknade filer dit förra kortet gick.
+    private func scanFinished() {
+        guard copyAfterScan, let plan else { return }
+        copyAfterScan = false
+        let todo = Set(missing.map(\.file.url))
+        if todo.isEmpty { nextCard() } else { copyMissing(todo, to: plan.folder, also: plan.also, subfolder: plan.subfolder, withCable: false) }
+    }
+
+    /// Kortet är klart: det matas ut och nästa kort i kön kollas. Formateras aldrig.
+    private func nextCard() {
+        guard let done = card else { return }
+        doneCards.append(DoneCard(key: cardKey(done), name: done.lastPathComponent, files: items.count { $0.status != .discarded }))
+        let next = waitingCards.first
+        if canEject { DispatchQueue.global(qos: .userInitiated).async { try? NSWorkspace.shared.unmountAndEjectDevice(at: done) } }
+        if let next { copyAfterScan = true; scan(next) } else { card = nil; items = []; shoots = [] }
     }
 
     /// Kopierar de valda filerna som bara finns på kortet till `folder`, med eller utan en undermapp per inspelningsdag.
     /// `anyStatus`: kopierar även filer som redan finns på en annan disk, när du själv har dragit dem hit.
     /// `also`: en andra mapp som får samma filer samtidigt. `subfolder`: mappmallens väg för varje fil.
-    func copyMissing(_ only: Set<URL>, to folder: URL, also: URL? = nil, subfolder: (CardFile) -> String = { _ in "" }, withCable: Bool = true, anyStatus: Bool = false) {
+    func copyMissing(_ only: Set<URL>, to folder: URL, also: URL? = nil, subfolder: @escaping (CardFile) -> String = { _ in "" }, withCable: Bool = true, anyStatus: Bool = false) {
+        // En kopiering pågår: den här väntar på sin tur. Filerna kopieras då även om de hunnit få en plats, eftersom du drog dem hit.
+        if copyingTo != nil {
+            queuedTargets.append(folder)
+            queuedCopies.append { [weak self] in self?.copyMissing(only, to: folder, also: also, subfolder: subfolder, withCable: false, anyStatus: true) }
+            return
+        }
+        plan = (folder, also, subfolder)
         // shortcut: kamerans undermappar plattas ut; om två filer hamnar på samma ställe med samma namn markeras den andra som misslyckad i stället för att skrivas över.
         let todo = items.enumerated().filter { (anyStatus || $0.element.status == .missing) && only.contains($0.element.file.url) }.map { i, it -> CopyJob in
-            let sub = subfolder(it.file), name = it.file.url.lastPathComponent
+            // Andra filer behåller sina mappar från kortet, så att t.ex. två README.txt inte krockar.
+            let sub = subfolder(it.file), name = it.file.other ? it.file.rel : it.file.url.lastPathComponent
             func place(_ base: URL) -> URL { templatePlace(base, sub).appendingPathComponent(name) }
             return (i, it.file, [folder] .map(place) + (also.map { [place($0)] } ?? []))
         }
@@ -456,7 +510,7 @@ final class Model: ObservableObject {
     }
 
     func copyForward() {
-        guard let f = forward else { return }
+        guard let f = forward, copyingTo == nil else { return }
         runCopies(forwardJobs().map { ($0.0, $0.1, [$0.2]) }, showing: f.folder)
     }
 
@@ -482,11 +536,15 @@ final class Model: ObservableObject {
     /// Kopierar med kontroll. Saknade filer blir kopierade eller misslyckade; filer som kopieras vidare
     /// finns redan säkert på en disk, så de behåller sin status och ett fel visas i stället efteråt.
     private func runCopies(_ todo: [CopyJob], showing folder: URL, also: URL? = nil) {
-        guard !todo.isEmpty else { return }
+        // Aldrig två kopieringar samtidigt; copyMissing ställer en ny i kö i stället.
+        guard !todo.isEmpty, copyingTo == nil else { return }
         busy = true
         copyingTo = folder
         copyingAlso = also
         let sides = sidecars
+        let log = card.map { historyURL(cardKey($0)) }
+        let cardName = card?.lastPathComponent ?? ""
+        let places = [folder.path] + (also.map { [$0.path] } ?? [])
         thumbs = []
         bytesDone = 0
         checkBytes = 0
@@ -503,23 +561,29 @@ final class Model: ObservableObject {
             var copied: [URL] = []
             var problems: [String] = []
             var failedCount = 0
+            var okFiles = 0
+            var okBytes: Int64 = 0
+            var rows: [ReportFile] = []
             // Även vid avbrott ska det som hann kopieras in i disklistan.
             defer { addToIndex(copied); logCopies(copied); Task { @MainActor in self?.refreshDisks() } }
             for (i, f, targets) in todo {
                 if Task.isCancelled { return }
                 // Förloppet räknas upp under tiden: en enda film kan vara 20 GB.
                 var streamed: Int64 = 0, checked: Int64 = 0
+                var hash: UInt64?
                 let results = copyVerified(f.url, to: targets, progress: { n in
                     streamed += Int64(n)
                     Task { @MainActor in self?.bytesDone += Int64(n) }
                 }, checked: { n in
                     checked += Int64(n)
                     Task { @MainActor in self?.checkBytes += Int64(n) }
-                })
+                }, hashed: { hash = $0 })
+                rows.append(ReportFile(rel: f.rel, size: f.size, hash: hash, ok: results.map { $0 == nil }))
                 let rest = f.size - streamed, restChecked = f.size - checked
                 let good = zip(targets, results).filter { $0.1 == nil }.map(\.0)
                 let errors = results.compactMap { $0?.localizedDescription }
                 copied += good
+                if !good.isEmpty { okFiles += 1; okBytes += f.size }
                 // Sidofilerna hamnar bredvid varje kopia. De är små, och ett fel på dem visas men stoppar inte kopieringen.
                 for side in sides[f.url] ?? [] {
                     let places = good.map { $0.deletingLastPathComponent().appendingPathComponent(side.lastPathComponent) }
@@ -547,8 +611,20 @@ final class Model: ObservableObject {
                 if !(good.isEmpty && isMissing) { problems += errors.map { "\(f.url.lastPathComponent): \($0)" } }
             }
             let finishedFiles = copied.count
+            var reports: [URL] = []
+            if okFiles + failedCount > 0, UserDefaults.standard.bool(forKey: "saveReport") {
+                let pics = await MainActor.run { self?.thumbs.compactMap { $0.jpeg() } ?? [] }
+                let now = Date()
+                let html = reportHTML(card: cardName, date: now, places: places, files: rows, thumbs: pics, version: appVersion)
+                reports = writeReport(html, card: cardName, date: now, to: places.map { URL(fileURLWithPath: $0) })
+            }
+            if let log, okFiles + failedCount > 0 {
+                appendHistory(CardEvent(kind: .copy, files: okFiles, bytes: okBytes, places: places, failed: failedCount,
+                                        reports: reports.isEmpty ? nil : reports.map(\.path)), to: log)
+            }
             await MainActor.run {
                 guard let self else { return }
+                if let log { self.cardHistory = loadHistory(log) }
                 self.busy = false
                 self.copyingTo = nil
                 self.copyingAlso = nil
@@ -565,6 +641,18 @@ final class Model: ObservableObject {
                     a.messageText = L("\(problems.count) \(problems.count == 1 ? "file" : "files") could not be copied to every place", "\(problems.count) \(problems.count == 1 ? "fil" : "filer") kunde inte kopieras till alla ställen")
                     a.informativeText = L("The originals are still on the card.\n\n", "Originalen finns kvar på kortet.\n\n") + problems.prefix(8).joined(separator: "\n")
                     a.runModal()
+                }
+                // Nästa kopiering som drogs medan den här pågick.
+                if !self.queuedCopies.isEmpty {
+                    let next = self.queuedCopies.removeFirst()
+                    self.queuedTargets.removeFirst()
+                    next()
+                    return
+                }
+                // Kön går bara vidare när allt gick bra; annars stannar den på kortet så att du ser vad som hände.
+                if failedCount + problems.count == 0, self.missing.isEmpty, UserDefaults.standard.bool(forKey: "sameNextCard"),
+                   self.plan != nil, !self.waitingCards.isEmpty {
+                    self.nextCard()
                 }
             }
         }
@@ -676,8 +764,14 @@ final class Model: ObservableObject {
         task?.cancel()
         busy = false
         formatting = true
+        let log = historyURL(cardKey(card))
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try formatVolume(card) }
+            if case .success = result {
+                appendHistory(CardEvent(kind: .format), to: log)
+                // Kortet har fått ett nytt id; historiken följer med.
+                carryHistory(from: log, to: historyURL(cardKey(card)))
+            }
             let ejectError = (try? result.get()).flatMap(ejectDevice)
             DispatchQueue.main.async {
                 self.formatting = false
@@ -739,4 +833,22 @@ final class Model: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         scan(url)
     }
+}
+
+let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+
+extension NSImage {
+    /// Liten JPEG till rapporten.
+    func jpeg() -> Data? {
+        guard let tiff = tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+    }
+}
+
+struct DoneCard: Identifiable {
+    let id = UUID()
+    /// Volymens id: kameror ger ofta alla kort samma namn.
+    let key: String
+    let name: String
+    let files: Int
 }

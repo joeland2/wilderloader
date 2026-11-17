@@ -134,12 +134,16 @@ struct ContentView: View {
     @State private var asking = false
     @State private var formatting = false
     @State private var why = false
-    @State private var fullInfo = false
+    @State private var pro = false
+    @AppStorage("saveReport") private var saveReport = false
+    @AppStorage("showCardBar") private var showCardBar = false
+    private var proOn: Bool { saveReport || showCardBar }
     @State private var cleaning = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            if m.cardQueue.count + m.doneCards.count > 1 { CardQueue().padding(.bottom, 14) }
             if !m.listDisks.isEmpty && m.listDisks.allSatisfy({ $0.count == nil && $0.progress == nil }) { firstScan.padding(.bottom, 16) }
             Flow(tiles: m.tiles, thumbs: m.thumbs, animating: m.copyingTo != nil) { cardView }
                 .frame(maxHeight: .infinity)
@@ -177,15 +181,20 @@ struct ContentView: View {
                     Text(m.leftovers.prefix(5).map(\.lastPathComponent).joined(separator: "\n"))
                 }
             }
-            Toggle(L("Full check", "Full kontroll"), isOn: $m.fullCheck)
-                .toggleStyle(.switch).controlSize(.mini).font(.system(size: 11, weight: .medium)).foregroundStyle(mute)
-                .help(L("Compares every file byte by byte. Safest, but reads the whole card and every copy.", "Jämför varje fil byte för byte. Säkrast, men läser hela kortet och alla kopior."))
-            Button { fullInfo.toggle() } label: { Image(systemName: "info.circle") }
-                .buttonStyle(.plain).foregroundStyle(mute)
-                .help(L("What is Full check?", "Vad är Full kontroll?"))
-                .accessibilityLabel(L("What is Full check?", "Vad är Full kontroll?"))
-                .popover(isPresented: $fullInfo) { FullCheckInfo() }
-                .padding(.trailing, 10)
+            // Allt för proffs ligger här, så att huvudvyn förblir enkel.
+            Button { pro.toggle() } label: {
+                HStack(spacing: 4) {
+                    Text("PRO").font(display(14)).tracking(1)
+                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .bold))
+                }
+                .foregroundStyle(m.fullCheck || proOn ? ok : mute)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(m.fullCheck || proOn ? ok.opacity(0.6) : panelLine))
+            }
+            .buttonStyle(.plain)
+            .help(L("Full check, reports and more", "Full kontroll, rapporter och mer"))
+            .popover(isPresented: $pro) { ProPanel().environmentObject(m) }
+            .padding(.trailing, 10)
             Text(L("Disks · \(scanned) of \(m.disks.count) scanned", "Diskar · \(scanned) av \(m.disks.count) skannade")).font(.system(size: 11, weight: .medium)).foregroundStyle(mute)
             Button { why.toggle() } label: { Image(systemName: "questionmark.circle") }
                 .buttonStyle(.plain).foregroundStyle(mute)
@@ -280,8 +289,11 @@ struct ContentView: View {
             } else if m.busy && m.bytesTotal > 0 {
                 let gb = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
                 progressBar(color, done: Double(m.bytesDone), total: Double(m.bytesTotal), label: L("\(gb(m.bytesDone)) of \(gb(m.bytesTotal))", "\(gb(m.bytesDone)) av \(gb(m.bytesTotal))"))
+            } else if showCardBar && m.card != nil && !m.busy && !(m.items.isEmpty && m.otherFiles.isEmpty) {
+                CardBar()
             }
             footerRow(text, color)
+            if m.card != nil && !m.cardHistory.isEmpty { HistoryDrawer() }
         }
         .padding(.top, 14)
         .overlay(alignment: .top) { Rectangle().fill(panelLine).frame(height: 1) }
@@ -375,7 +387,8 @@ struct ContentView: View {
         let total = m.items.count
         if m.card == nil { return (L("Waiting for a memory card", "Väntar på ett minneskort"), mute) }
         if let to = m.copyingTo {
-            return (L("Copying \(min(m.copyDone + 1, m.copyTotal)) of \(m.copyTotal) → \(placeLabel(to.path))", "Kopierar \(min(m.copyDone + 1, m.copyTotal)) av \(m.copyTotal) → \(placeLabel(to.path))"), copy)
+            let next = m.queuedTargets.isEmpty ? "" : L(" · then ", " · sedan ") + m.queuedTargets.map { placeLabel($0.path) }.joined(separator: ", ")
+            return (L("Copying \(min(m.copyDone + 1, m.copyTotal)) of \(m.copyTotal) → \(placeLabel(to.path))", "Kopierar \(min(m.copyDone + 1, m.copyTotal)) av \(m.copyTotal) → \(placeLabel(to.path))") + next, copy)
         }
         if m.busy && m.bytesTotal > 0 { return (L("Full check · \(m.checked) of \(m.items.count { if case .verifying = $0.status { return true }; return false } + m.checked) files", "Full kontroll · \(m.checked) av \(m.items.count { if case .verifying = $0.status { return true }; return false } + m.checked) filer"), ok) }
         if m.busy { return (L("Looking for the files on other disks…", "Letar efter filerna på andra diskar…"), mute) }
@@ -411,18 +424,35 @@ struct ShootStack: View {
         let dates = files.map(\.file.date)
         let first = dates.min() ?? Date(), last = dates.max() ?? first
         let missing = files.count { $0.status == .missing }
+        // Filer som inte är inspelningar: en egen grupp utan datum.
+        let other = files.first?.file.other == true
         // Flera fotograferingar samma dag får samma datum, så tiden skiljer dem åt.
-        let sameDay = all.contains { $0 != group && m.items(in: $0).first.map { Calendar.current.isDate($0.file.date, inSameDayAs: first) } == true }
+        let sameDay = !other && all.contains { $0 != group && m.items(in: $0).first.map { !$0.file.other && Calendar.current.isDate($0.file.date, inSameDayAs: first) } == true }
         Button { NSWorkspace.shared.activateFileViewerSelecting(files.map(\.file.url)) } label: {
             VStack(spacing: 2) {
                 Group {
-                    if let thumb { Image(nsImage: thumb).resizable().scaledToFill() } else { cardFill }
+                    if other {
+                        // Namnen direkt, så att du ser vad det är utan att öppna något.
+                        let names = files.map(\.file.url.lastPathComponent)
+                        ZStack(alignment: .topLeading) {
+                            cardFill
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(names.prefix(names.count > 4 ? 3 : 4), id: \.self) { n in
+                                    Text(n).lineLimit(1).truncationMode(.middle)
+                                }
+                                if names.count > 4 { Text(L("+ \(names.count - 3) more", "+ \(names.count - 3) till")).foregroundStyle(mute) }
+                            }
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(missing > 0 ? miss : fg)
+                            .padding(6)
+                        }
+                    } else if let thumb { Image(nsImage: thumb).resizable().scaledToFill() } else { cardFill }
                 }
                 .frame(maxWidth: .infinity).frame(height: 62)
                 .clipShape(RoundedRectangle(cornerRadius: 2))
                 .overlay(RoundedRectangle(cornerRadius: 2).stroke(hovering ? fg : missing > 0 ? miss : panelLine, lineWidth: hovering || missing > 0 ? 1.5 : 1))
                 .padding(.bottom, 3)
-                Text(shootDate(first, last)).font(display(18)).tracking(0.6).lineLimit(1).minimumScaleFactor(0.7)
+                Text(other ? L("Other files", "Andra filer") : shootDate(first, last)).font(display(18)).tracking(0.6).lineLimit(1).minimumScaleFactor(0.7)
                     .foregroundStyle(missing > 0 ? miss : fg)
                 Text(sameDay ? "\(shootTime(first))–\(shootTime(last)) · \(count(missing))" : count(missing))
                     .font(.system(size: 11)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
@@ -436,7 +466,7 @@ struct ShootStack: View {
         .task(id: group.first) {
             thumb = nil
             let files = m.items(in: group)
-            guard !files.isEmpty else { return }
+            guard !files.isEmpty, files.first?.file.other != true else { return }
             m.loadThumbs([files[files.count / 2].file.url]) { thumb = $0 }
         }
     }
@@ -518,8 +548,11 @@ struct Flow<Card: View>: View {
             // shortcut: rutorna delar på bredden; med väldigt många diskar blir de smala, byt då till en rullbar rad.
             let n = CGFloat(max(tiles.count, 1)), tw = (w - gap * (n - 1)) / n
             let tileX = { (i: Int) in CGFloat(i) * (tw + gap) + tw / 2 }
-            let ports = m.card != nil && !m.busy && !m.items.isEmpty
-            let shown = fitShoots(m.shoots, to: Int(w / 76))
+            // Även under kopieringen, så att du kan dra en linje till en andra disk; den kopieringen tar vid när den första är klar.
+            let ports = m.card != nil && (!m.busy || m.copyingTo != nil) && !m.items.isEmpty
+            // Gruppen med andra filer slås aldrig ihop med en fotografering.
+            let extra = m.shoots.last.flatMap { g in m.items(in: g).first?.file.other == true ? g : nil }
+            let shown = extra.map { fitShoots(Array(m.shoots.dropLast()), to: Int(w / 76) - 1) + [$0] } ?? fitShoots(m.shoots, to: Int(w / 76))
             let shootW = min(120, w / CGFloat(max(shown.count, 1)))
             let shootX = { (k: Int) in w / 2 + (CGFloat(k) - CGFloat(shown.count - 1) / 2) * shootW }
             let shootY = cardH + (shown.isEmpty ? 0 : shootH)
@@ -551,7 +584,9 @@ struct Flow<Card: View>: View {
                             var path = Path()
                             path.move(to: a)
                             path.addCurve(to: CGPoint(x: q.x, y: q.y - 11), control1: CGPoint(x: a.x, y: (a.y + q.y) / 2 + 10), control2: CGPoint(x: q.x, y: a.y + 20))
-                            ctx.stroke(path, with: .color(miss), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 5]))
+                            // Under kopieringen är det ett erbjudande om en backup, inte något som saknas: tunnare och dovare.
+                            let backup = m.copyingTo != nil
+                            ctx.stroke(path, with: .color(backup ? mute.opacity(0.5) : miss), style: StrokeStyle(lineWidth: backup ? 1.2 : 2, lineCap: .round, dash: backup ? [2, 4] : [6, 5]))
                         }
                         for (k, l) in routes {
                             let a = CGPoint(x: shown.isEmpty ? w / 2 : shootX(k), y: shootY)
@@ -717,16 +752,30 @@ struct Flow<Card: View>: View {
                     // Frågetecknet: dra det till en disk för att kopiera, eller klicka för att se filerna.
                     ForEach(asking, id: \.self) { k in
                         let n = m.items(in: shown[k]).count { $0.status == .missing }
-                        Text("?").font(.system(size: 12, weight: .bold)).foregroundStyle(miss)
-                            .frame(width: 22, height: 22)
-                            .background(Circle().fill(bg))
-                            .overlay(Circle().stroke(miss, lineWidth: 1.5))
+                        let backup = m.copyingTo != nil
+                        Group {
+                            if backup {
+                                // Under kopieringen: en liten plupp för en andra kopia. Den som inte vill ha en låter den vara.
+                                Circle().fill(bg).overlay(Circle().stroke(mute, lineWidth: 1.5)).frame(width: 12, height: 12)
+                                    .frame(width: 22, height: 22)
+                                    .overlay(alignment: .leading) {
+                                        Text(L("Backup? Drag to another disk", "Backup? Dra till en annan disk"))
+                                            .font(.system(size: 10)).foregroundStyle(mute).fixedSize().offset(x: 26)
+                                    }
+                            } else {
+                                Text("?").font(.system(size: 12, weight: .bold)).foregroundStyle(miss)
+                                    .frame(width: 22, height: 22)
+                                    .background(Circle().fill(bg))
+                                    .overlay(Circle().stroke(miss, lineWidth: 1.5))
+                            }
+                        }
                             .padding(6)
                             .contentShape(Circle())
                             .opacity(dragShoot == k ? 0 : 1)
                             .position(askAt(k))
-                            .onTapGesture { missingDetail = m.missingTile }
-                            .help(L("\(n) \(n == 1 ? "file has" : "files have") no place yet. Drag to a disk to copy, or click to see them.", "\(n) \(n == 1 ? "fil" : "filer") har ingen plats än. Dra till en disk för att kopiera, eller klicka för att se dem."))
+                            .onTapGesture { if !backup { missingDetail = m.missingTile } }
+                            .help(backup ? L("Drag to another disk to put a second copy there when this copy is done", "Dra till en annan disk för att lägga en andra kopia där när den här kopieringen är klar")
+                                         : L("\(n) \(n == 1 ? "file has" : "files have") no place yet. Drag to a disk to copy, or click to see them.", "\(n) \(n == 1 ? "fil" : "filer") har ingen plats än. Dra till en disk för att kopiera, eller klicka för att se dem."))
                             .gesture(DragGesture(minimumDistance: 2, coordinateSpace: .named("flow"))
                                 .updating($liveDrag) { _, live, _ in live = true }
                                 .onChanged { v in
@@ -741,7 +790,7 @@ struct Flow<Card: View>: View {
                                         dragShoot = nil
                                     } else { retract(to: askAt(k)) }
                                 })
-                            .accessibilityLabel(L("\(n) files with no place yet", "\(n) filer utan plats än"))
+                            .accessibilityLabel(backup ? L("Backup to another disk", "Backup till en annan disk") : L("\(n) files with no place yet", "\(n) filer utan plats än"))
                             .accessibilityAddTraits(.isButton)
                     }
 
@@ -2087,8 +2136,8 @@ struct FormatSheet: View {
                 Text(L("\(m.discarded.count) files you marked as culled are erased too.", "\(m.discarded.count) filer som du markerat som rensade raderas också."))
                     .font(.system(size: 12)).foregroundStyle(mute)
             }
-            if m.minorFiles > 0 {
-                Text(L("\(m.minorFiles) small metadata files, such as XML and thumbnails, aren't compared with any copy.", "\(m.minorFiles) små metadatafiler, som XML och miniatyrer, jämförs inte med någon kopia."))
+            if !m.minorFiles.isEmpty {
+                Text(L("\(m.minorFiles.count) small metadata files, such as XML and thumbnails, aren't compared with any copy.", "\(m.minorFiles.count) små metadatafiler, som XML och miniatyrer, jämförs inte med någon kopia."))
                     .font(.system(size: 12)).foregroundStyle(mute).fixedSize(horizontal: false, vertical: true)
             }
             Text(L("If your camera prefers to format the card itself, do it there instead.", "Vill kameran helst formatera själv kan du göra det där i stället.")).font(.system(size: 11)).foregroundStyle(mute)
@@ -2319,5 +2368,246 @@ struct ForwardBubble: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(layout == l ? .isSelected : [])
+    }
+}
+
+/// Allt på kortet i en stapel: det som finns på en annan disk, det som saknas och kortets egna filer.
+/// Så länge något är gult är kortet inte färdigt. Varje del visar sina filer i Finder.
+struct CardBar: View {
+    @EnvironmentObject var m: Model
+
+    private struct Part: Identifiable {
+        let id: String
+        let label: String
+        let color: Color
+        let urls: [URL]
+    }
+
+    private var parts: [Part] {
+        var safeURLs: [URL] = [], missing: [URL] = [], failed: [URL] = [], culled: [URL] = []
+        for it in m.items {
+            switch it.status {
+            case .found, .listed, .copied, .verifying: safeURLs.append(it.file.url)
+            case .missing, .checking: missing.append(it.file.url)
+            case .failed: failed.append(it.file.url)
+            case .discarded: culled.append(it.file.url)
+            }
+        }
+        let n = { (c: Int, one: String, many: String) in "\(c.formatted()) \(c == 1 ? one : many)" }
+        return [
+            Part(id: "safe", label: L("\(n(safeURLs.count, "file", "files")) on a disk", "\(n(safeURLs.count, "fil", "filer")) på en disk"), color: safe, urls: safeURLs),
+            Part(id: "missing", label: L("\(n(missing.count, "file", "files")) not copied", "\(n(missing.count, "fil", "filer")) inte kopierade"), color: miss, urls: missing),
+            Part(id: "failed", label: L("\(n(failed.count, "file", "files")) failed", "\(n(failed.count, "fil", "filer")) misslyckades"), color: fail, urls: failed),
+            Part(id: "package", label: L("\(n(m.otherFiles.count, "package", "packages")) to copy in Finder", "\(n(m.otherFiles.count, "paket", "paket")) att kopiera i Finder"), color: miss.opacity(0.55), urls: m.otherFiles),
+            Part(id: "culled", label: L("\(n(culled.count, "culled file", "culled files"))", "\(n(culled.count, "rensad fil", "rensade filer"))"), color: mute.opacity(0.6), urls: culled),
+            Part(id: "camera", label: L("\(n(m.minorFiles.count, "camera file", "camera files"))", "\(n(m.minorFiles.count, "kamerafil", "kamerafiler"))"), color: mute.opacity(0.3), urls: m.minorFiles),
+        ].filter { !$0.urls.isEmpty }
+    }
+
+    var body: some View {
+        let parts = parts, total = parts.reduce(0) { $0 + $1.urls.count }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(L("Everything on the card", "Allt på kortet")).font(display(15)).tracking(0.8)
+                Text(L("\(total.formatted()) files", "\(total.formatted()) filer")).font(.system(size: 11)).foregroundStyle(mute).monospacedDigit()
+            }
+            GeometryReader { g in
+                // Varje del är minst några punkter bred, så att en enda fil som saknas aldrig blir osynlig.
+                let minW: CGFloat = 6, spare = g.size.width - CGFloat(parts.count) * minW - CGFloat(max(parts.count - 1, 0)) * 2
+                HStack(spacing: 2) {
+                    ForEach(parts) { p in
+                        Rectangle().fill(p.color)
+                            .frame(width: minW + max(0, spare) * CGFloat(p.urls.count) / CGFloat(max(total, 1)))
+                            .onTapGesture { NSWorkspace.shared.activateFileViewerSelecting(p.urls) }
+                            .help(p.label)
+                    }
+                }
+            }
+            .frame(height: 8)
+            .clipShape(RoundedRectangle(cornerRadius: 2))
+            HStack(spacing: 14) {
+                ForEach(parts) { p in
+                    Button { NSWorkspace.shared.activateFileViewerSelecting(p.urls) } label: {
+                        HStack(spacing: 5) {
+                            Circle().fill(p.color).frame(width: 7, height: 7)
+                            Text(p.label).monospacedDigit()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Show them in Finder", "Visa dem i Finder"))
+                }
+            }
+            .font(.system(size: 11)).foregroundStyle(mute)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(L("Everything on the card", "Allt på kortet"))
+    }
+}
+
+/// Kortets historik: en rad som fälls ut till en tidslinje. Stängd från början.
+struct HistoryDrawer: View {
+    @EnvironmentObject var m: Model
+    /// Sparas, så att lådan är som du lämnade den.
+    @AppStorage("historyOpen") private var open = false
+    @State private var picked: Int?
+
+    var body: some View {
+        let events = Array(m.cardHistory.suffix(6))
+        VStack(alignment: .leading, spacing: 8) {
+            Button { withAnimation(.easeOut(duration: 0.2)) { open.toggle() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).rotationEffect(.degrees(open ? 90 : 0))
+                    Text(L("History", "Historik")).font(display(15)).tracking(0.8)
+                    if let last = events.last {
+                        Text(L("· last \(when(last.date))", "· senast \(when(last.date))")).font(.system(size: 11)).foregroundStyle(mute)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(L("What has been done with this card", "Vad som gjorts med det här kortet"))
+            if open {
+                HStack(alignment: .top, spacing: 0) {
+                    ForEach(Array(events.enumerated()), id: \.offset) { k, e in
+                        node(e, picked: picked == k).onTapGesture { picked = picked == k ? nil : k }
+                        Rectangle().fill(panelLine).frame(height: 1).frame(maxWidth: .infinity).padding(.horizontal, 10).padding(.top, 8)
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Circle().stroke(m.formatReady ? safe : miss, lineWidth: 1.2).frame(width: 9, height: 9)
+                            Text(L("Now", "Nu")).font(display(14)).foregroundStyle(m.formatReady ? safe : miss)
+                        }
+                        Text(m.formatReady ? L("ready to format", "kan formateras") : L("\(m.missing.count) not copied", "\(m.missing.count) inte kopierade"))
+                            .font(.system(size: 10)).foregroundStyle(mute)
+                    }
+                    .fixedSize()
+                }
+                if let k = picked, k < events.count, !events[k].places.isEmpty {
+                    HStack(spacing: 8) {
+                        Text(events[k].places.map { placeLabel($0, full: true) }.joined(separator: "  ·  ")).font(.system(size: 11)).foregroundStyle(mute)
+                            .lineLimit(1).truncationMode(.middle)
+                        Button(L("Show in Finder", "Visa i Finder")) {
+                            NSWorkspace.shared.activateFileViewerSelecting(events[k].places.map { URL(fileURLWithPath: $0) })
+                        }
+                        .buttonStyle(.borderless).font(.system(size: 11, weight: .semibold))
+                        if let report = events[k].reports?.first(where: { FileManager.default.fileExists(atPath: $0) }) {
+                            Button(L("Open report", "Öppna rapporten")) { NSWorkspace.shared.open(URL(fileURLWithPath: report)) }
+                                .buttonStyle(.borderless).font(.system(size: 11, weight: .semibold))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func node(_ e: CardEvent, picked: Bool) -> some View {
+        let color: Color = e.kind == .format ? mute : e.failed > 0 ? fail : safe
+        let gb = ByteCountFormatter.string(fromByteCount: e.bytes, countStyle: .file)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Circle().fill(color).frame(width: 9, height: 9).overlay(Circle().stroke(fg, lineWidth: picked ? 1.5 : 0).padding(-3))
+                Text(when(e.date)).font(display(14)).lineLimit(1)
+            }
+            Group {
+                if e.kind == .format { Text(L("Formatted", "Formaterat")) }
+                else { Text(L("\(e.files) copied · \(gb)", "\(e.files) kopierade · \(gb)") + (e.failed > 0 ? L(" · \(e.failed) failed", " · \(e.failed) misslyckades") : "")) }
+            }
+            .font(.system(size: 10)).foregroundStyle(mute).lineLimit(1)
+        }
+        .fixedSize()
+        .contentShape(Rectangle())
+        .help(e.places.isEmpty ? "" : e.places.map { placeLabel($0, full: true) }.joined(separator: "\n"))
+    }
+
+    private func when(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = appLang.locale
+        f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "d MMM HH:mm"
+        return Calendar.current.isDateInToday(d) ? L("today \(f.string(from: d))", "idag \(f.string(from: d))") : f.string(from: d)
+    }
+}
+
+/// Valen för proffs. Allt är av från början.
+struct ProPanel: View {
+    @EnvironmentObject var m: Model
+    @AppStorage("saveReport") private var saveReport = false
+    @AppStorage("showCardBar") private var showCardBar = false
+    @State private var fullInfo = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("PRO").font(display(22)).tracking(1)
+            row(L("Full check", "Full kontroll"), L("Compares every file byte by byte before you format. Takes minutes instead of seconds.", "Jämför varje fil byte för byte innan du formaterar. Tar minuter i stället för sekunder."), $m.fullCheck) {
+                Button(L("More", "Mer")) { fullInfo = true }.buttonStyle(.borderless).font(.system(size: 11))
+                    .popover(isPresented: $fullInfo) { FullCheckInfo() }
+            }
+            row(L("Report with every copy", "Rapport vid varje kopiering"), L("Saves an HTML report next to the copy: every file, its checksum and where it went. For clients and productions.", "Sparar en HTML-rapport bredvid kopian: varje fil, dess kontrollsumma och vart den gick. För kunder och produktioner."), $saveReport)
+            row(L("Everything on the card", "Allt på kortet"), L("A bar under the map with every file on the card, including the camera's own files.", "En stapel under kartan med varje fil på kortet, även kamerans egna filer."), $showCardBar)
+        }
+        .padding(18)
+        .frame(width: 360)
+    }
+
+    private func row<Extra: View>(_ title: String, _ text: String, _ on: Binding<Bool>, @ViewBuilder extra: () -> Extra = { EmptyView() }) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) { Text(title).font(.system(size: 13, weight: .semibold)); extra() }
+                Text(text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Toggle("", isOn: on).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        }
+    }
+}
+
+/// Korten i rad när flera sitter i: klara, det som visas och de som väntar. Syns bara med fler än ett kort.
+struct CardQueue: View {
+    @EnvironmentObject var m: Model
+    @AppStorage("sameNextCard") private var sameNextCard = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(m.doneCards) { d in
+                chip(d.name, L("✓ done · \(d.files) files", "✓ klart · \(d.files) filer"), safe, line: safe)
+            }
+            if let card = m.card {
+                let copying = m.copyingTo != nil
+                let f = m.bytesTotal > 0 ? Double(m.bytesDone + m.checkBytes) / Double(2 * m.bytesTotal) : 0
+                chip(card.lastPathComponent,
+                     copying ? L("copying · \(Int(f * 100)) %", "kopierar · \(Int(f * 100)) %") : m.busy ? L("checking…", "kollar…") : L("showing", "visas"),
+                     copying ? copy : fg, line: copying ? copy : fg, progress: copying ? f : nil)
+            }
+            ForEach(m.waitingCards, id: \.self) { u in
+                Button { m.scan(u) } label: { chip(u.lastPathComponent, L("waiting", "väntar"), mute, line: panelLine) }
+                    .buttonStyle(.plain)
+                    .disabled(m.copyingTo != nil)
+                    .help(L("Show \(u.lastPathComponent)", "Visa \(u.lastPathComponent)"))
+            }
+            Spacer(minLength: 0)
+            Toggle(isOn: $sameNextCard) {
+                Text(L("Next card to the same place", "Nästa kort till samma plats")).font(.system(size: 12, weight: .semibold))
+            }
+            .toggleStyle(.switch).controlSize(.small)
+            .foregroundStyle(sameNextCard ? fg : mute)
+            .help(L("When a card is done it's ejected, and the next one is copied to the same place. Never formatted.", "När ett kort är klart matas det ut, och nästa kopieras till samma plats. Formateras aldrig."))
+        }
+    }
+
+    private func chip(_ name: String, _ state: String, _ color: Color, line: Color, progress: Double? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name).font(display(16)).tracking(0.6).lineLimit(1).foregroundStyle(fg)
+            Text(state).font(.system(size: 11)).monospacedDigit().foregroundStyle(color).lineLimit(1)
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(idle)
+                    Capsule().fill(color).frame(width: g.size.width * (progress ?? (color == safe ? 1 : 0)))
+                }
+            }
+            .frame(height: 3)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .frame(width: 170, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 4).fill(cardFill))
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(line.opacity(0.7)))
     }
 }

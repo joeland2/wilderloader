@@ -34,8 +34,8 @@ let sidecarFiles: Set<String> = [
 
 /// Kortets egna register och inställningar. Skapas av kameran, och raderas utan varning så länge de är små.
 private let cardSystemFiles: Set<String> = [
-    "bdm", "mpl", "cpi", "bnp", "inp", "tdt", "tid", "dat", "bup", "ifo", "sav", "bin", "ini", "cfg", "txt", "log", "nfo", "sys",
-    "db", "idx", "lst", "sig", "tbl", "plist", "json",
+    "bdm", "mpl", "cpi", "bnp", "inp", "tdt", "tid", "dat", "bup", "ifo", "sav", "bin", "ini", "cfg", "sys",
+    "db", "idx", "lst", "sig", "tbl",
 ]
 
 /// Större än så här kan vara en inspelning, oavsett filändelse.
@@ -53,33 +53,31 @@ struct CardContents {
     var files: [CardFile] = []
     /// Klippets sidofiler, med klippets adress som nyckel.
     var sidecars: [URL: [URL]] = [:]
-    /// Filer appen inte kan kontrollera. Formatering utan varning spärras så länge de finns.
+    /// Paket (mappar som ser ut som filer) som appen inte kan kopiera. Formatering utan varning spärras så länge de finns.
     var other: [URL] = []
     /// Små register- och sidofiler. De jämförs inte med någon kopia.
-    var minor = 0
+    var minor: [URL] = []
 }
 
 /// Går igenom allt på kortet och delar upp det. Dolda filer och systemmappar räknas inte.
+/// Filer som varken är inspelningar, sidofiler eller kortets register kommer sist i `files`, med `other` satt,
+/// så att de kan kopieras och kontrolleras som allt annat. Inget får försvinna vid formateringen utan att synas.
 func cardContents(_ root: URL) -> CardContents {
     let keys: [URLResourceKey] = [.isRegularFileKey, .isPackageKey, .fileSizeKey, .contentModificationDateKey]
     guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
                                                  options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return CardContents() }
     let base = root.standardizedFileURL.path
     var out = CardContents()
-    var small: [(url: URL, size: Int64)] = []
+    var small: [CardFile] = []
     for case let url as URL in e {
         if systemFolders.contains(url.lastPathComponent) { e.skipDescendants(); continue }
         guard let v = try? url.resourceValues(forKeys: Set(keys)) else { continue }
         if v.isPackage == true { out.other.append(url); continue }
         guard v.isRegularFile == true else { continue }
-        let size = Int64(v.fileSize ?? 0)
-        if isMedia(url) {
-            let path = url.standardizedFileURL.path
-            let rel = path.hasPrefix(base + "/") ? String(path.dropFirst(base.count + 1)) : url.lastPathComponent
-            out.files.append(CardFile(url: url, rel: rel, size: size, date: v.contentModificationDate ?? Date()))
-        } else {
-            small.append((url, size))
-        }
+        let path = url.standardizedFileURL.path
+        let rel = path.hasPrefix(base + "/") ? String(path.dropFirst(base.count + 1)) : url.lastPathComponent
+        let f = CardFile(url: url, rel: rel, size: Int64(v.fileSize ?? 0), date: v.contentModificationDate ?? Date())
+        if isMedia(url) { out.files.append(f) } else { small.append(f) }
     }
     out.files.sort { $0.rel < $1.rel }
 
@@ -92,7 +90,9 @@ func cardContents(_ root: URL) -> CardContents {
         if let cut = stem.range(of: #"_\d{3}$"#, options: .regularExpression) { names.append(String(stem[..<cut.lowerBound])) }
         for n in names { clips[dir, default: [:]][n, default: []].append(f.url) }
     }
-    for (url, size) in small {
+    var extra: [CardFile] = []
+    for f in small {
+        let url = f.url, size = f.size
         let ext = url.pathExtension.lowercased()
         if sidecarFiles.contains(ext) {
             // Sony skriver C0001M01.XML till C0001.MP4, så klippets namn kan vara början på sidofilens.
@@ -103,12 +103,17 @@ func cardContents(_ root: URL) -> CardContents {
             while owners == nil, n >= 4 { owners = inDir[String(stem.prefix(n))]; n -= 1 }
             if let owners {
                 for o in owners { out.sidecars[o, default: []].append(url) }
-                out.minor += 1
+                out.minor.append(url)
                 continue
             }
         }
-        if size < minorFileLimit, sidecarFiles.contains(ext) || cardSystemFiles.contains(ext) { out.minor += 1 } else { out.other.append(url) }
+        if size < minorFileLimit, sidecarFiles.contains(ext) || cardSystemFiles.contains(ext) { out.minor.append(url) } else {
+            var o = f
+            o.other = true
+            extra.append(o)
+        }
     }
+    out.files += extra.sorted { $0.rel < $1.rel }
     out.other.sort { $0.path < $1.path }
     return out
 }
@@ -203,6 +208,7 @@ func testFormats() {
     try! fm.createDirectory(at: root.appendingPathComponent("System Volume Information"), withIntermediateDirectories: true)
     func make(_ name: String, _ bytes: Int = 10) -> URL {
         let u = name.contains("/") ? root.appendingPathComponent(name) : dir.appendingPathComponent(name)
+        try! fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         try! Data(count: bytes).write(to: u)
         return u
     }
@@ -214,16 +220,23 @@ func testFormats() {
     _ = make("System Volume Information/x.xyz")                 // Systemmapp: räknas inte.
     let unknown = make("A.XYZ")                                 // Okänd liten fil.
     let bigSystem = make("HUGE.BIN", Int(minorFileLimit))       // Stor med registerändelse kan vara en inspelning.
+    let note = make("NOTES/shotlist.txt")                       // Text skriven av en människa, aldrig kortets register.
+    let pkg = root.appendingPathComponent("Edit.bundle")
+    try! fm.createDirectory(at: pkg, withIntermediateDirectories: true)
     let c = cardContents(root)
-    assert(Set(c.files.map(\.url.lastPathComponent)) == [sony.lastPathComponent, red.lastPathComponent, braw.lastPathComponent], "\(c.files.map(\.rel))")
+    let media = c.files.filter { !$0.other }, extra = c.files.filter(\.other)
+    assert(Set(media.map(\.url.lastPathComponent)) == [sony.lastPathComponent, red.lastPathComponent, braw.lastPathComponent], "\(c.files.map(\.rel))")
+    assert(Set(extra.map(\.url.lastPathComponent)) == [unknown.lastPathComponent, bigSystem.lastPathComponent, note.lastPathComponent], "\(extra.map(\.rel))")
+    assert(c.files.drop { !$0.other }.allSatisfy(\.other), "andra filer ska ligga sist")
+    assert(extra.contains { $0.rel == "NOTES/shotlist.txt" }, "sökvägen på kortet ska följa med")
     // Tillfälliga mappar kan heta /var eller /private/var, så klippen slås upp på filnamnet.
     func sides(_ clip: URL) -> [String]? { c.sidecars.first { $0.key.lastPathComponent == clip.lastPathComponent }?.value.map(\.lastPathComponent) }
     assert(sides(sony) == [sonyXML.lastPathComponent], "Sonys XML ska höra till klippet")
     assert(sides(red) == [redSide.lastPathComponent], "REDs RMD ska höra till klippet")
     assert(sides(braw) == [brawSide.lastPathComponent], "BRAW:s sidofil ska höra till klippet")
-    assert(Set(c.other.map(\.lastPathComponent)) == [unknown.lastPathComponent, bigSystem.lastPathComponent], "\(c.other)")
-    assert(c.minor == 5, "\(c.minor)")
-    assert(describeKinds(c.other) == "1 BIN, 1 XYZ", describeKinds(c.other))
+    assert(c.other.map(\.lastPathComponent) == [pkg.lastPathComponent], "bara paket kan inte kopieras: \(c.other)")
+    assert(c.minor.count == 5, "\(c.minor)")
+    assert(describeKinds(extra.map(\.url)) == "1 BIN, 1 TXT, 1 XYZ", describeKinds(extra.map(\.url)))
 
     let day = Calendar.current.date(from: DateComponents(year: 2026, month: 11, day: 5, hour: 12))!
     assert(renderTemplate(filmTemplate, project: "Coast", camera: "Cam A", date: day) == "Coast/01_RAW/Cam A/2026-11-05", "mallen")
