@@ -2,13 +2,15 @@
 # Bygger "WilderLoader.app" utan Xcode. Koden ligger kvar under namnet Kortkoll, som appen hette förut.
 set -euo pipefail
 cd "$(dirname "$0")"
-swift build -c release
+# Universal binary (Apple silicon + Intel) without Xcode: build each arch, then lipo.
+swift build -c release --triple arm64-apple-macosx14.0
+swift build -c release --triple x86_64-apple-macosx14.0
 APP="build/WilderLoader.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp -R Resources/Fonts "$APP/Contents/Resources/Fonts"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-cp .build/release/Kortkoll "$APP/Contents/MacOS/WilderLoader"
+lipo -create .build/arm64-apple-macosx/release/Kortkoll .build/x86_64-apple-macosx/release/Kortkoll -output "$APP/Contents/MacOS/WilderLoader"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

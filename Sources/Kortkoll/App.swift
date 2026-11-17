@@ -544,7 +544,7 @@ final class Model: ObservableObject {
         let sides = sidecars
         let log = card.map { historyURL(cardKey($0)) }
         let cardName = card?.lastPathComponent ?? ""
-        let places = [folder.path] + (also.map { [$0.path] } ?? [])
+        let places = [folder.standardizedFileURL.path] + (also.map { [$0.standardizedFileURL.path] } ?? [])
         thumbs = []
         bytesDone = 0
         checkBytes = 0
@@ -564,6 +564,8 @@ final class Model: ObservableObject {
             var okFiles = 0
             var okBytes: Int64 = 0
             var rows: [ReportFile] = []
+            var mhl: [String: [MHLEntry]] = [:]
+            let started = Date()
             // Även vid avbrott ska det som hann kopieras in i disklistan.
             defer { addToIndex(copied); logCopies(copied); Task { @MainActor in self?.refreshDisks() } }
             for (i, f, targets) in todo {
@@ -579,6 +581,14 @@ final class Model: ObservableObject {
                     Task { @MainActor in self?.checkBytes += Int64(n) }
                 }, hashed: { hash = $0 })
                 rows.append(ReportFile(rel: f.rel, size: f.size, hash: hash, ok: results.map { $0 == nil }))
+                if let hash {
+                    for (dst, err) in zip(targets, results) where err == nil {
+                        let p = dst.standardizedFileURL.path
+                        for root in places where p.hasPrefix(root + "/") {
+                            mhl[root, default: []].append(MHLEntry(path: String(p.dropFirst(root.count + 1)), size: f.size, modified: f.date, hash: hash))
+                        }
+                    }
+                }
                 let rest = f.size - streamed, restChecked = f.size - checked
                 let good = zip(targets, results).filter { $0.1 == nil }.map(\.0)
                 let errors = results.compactMap { $0?.localizedDescription }
@@ -611,6 +621,9 @@ final class Model: ObservableObject {
                 if !(good.isEmpty && isMissing) { problems += errors.map { "\(f.url.lastPathComponent): \($0)" } }
             }
             let finishedFiles = copied.count
+            if UserDefaults.standard.bool(forKey: "saveMHL") {
+                for (root, entries) in mhl { writeMHL(mhlXML(entries, start: started, finish: Date(), version: appVersion), in: URL(fileURLWithPath: root), date: started) }
+            }
             var reports: [URL] = []
             if okFiles + failedCount > 0, UserDefaults.standard.bool(forKey: "saveReport") {
                 let pics = await MainActor.run { self?.thumbs.compactMap { $0.jpeg() } ?? [] }

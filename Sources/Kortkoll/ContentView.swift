@@ -137,7 +137,8 @@ struct ContentView: View {
     @State private var pro = false
     @AppStorage("saveReport") private var saveReport = false
     @AppStorage("showCardBar") private var showCardBar = false
-    private var proOn: Bool { saveReport || showCardBar }
+    @AppStorage("saveMHL") private var saveMHL = false
+    private var proOn: Bool { saveReport || showCardBar || saveMHL }
     @State private var cleaning = false
 
     var body: some View {
@@ -2532,6 +2533,7 @@ struct ProPanel: View {
     @EnvironmentObject var m: Model
     @AppStorage("saveReport") private var saveReport = false
     @AppStorage("showCardBar") private var showCardBar = false
+    @AppStorage("saveMHL") private var saveMHL = false
     @State private var fullInfo = false
 
     var body: some View {
@@ -2542,6 +2544,7 @@ struct ProPanel: View {
                     .popover(isPresented: $fullInfo) { FullCheckInfo() }
             }
             row(L("Report with every copy", "Rapport vid varje kopiering"), L("Saves an HTML report next to the copy: every file, its checksum and where it went. For clients and productions.", "Sparar en HTML-rapport bredvid kopian: varje fil, dess kontrollsumma och vart den gick. För kunder och produktioner."), $saveReport)
+            row(L("MHL with every copy", "MHL vid varje kopiering"), L("Saves a checksum list (MHL 1.1, xxHash-64) in the folder you copy to. Other tools, like Silverstack, can check the footage against it later.", "Sparar en lista med kontrollsummor (MHL 1.1, xxHash-64) i mappen du kopierar till. Andra program, som Silverstack, kan kontrollera materialet mot den senare."), $saveMHL)
             row(L("Everything on the card", "Allt på kortet"), L("A bar under the map with every file on the card, including the camera's own files.", "En stapel under kartan med varje fil på kortet, även kamerans egna filer."), $showCardBar)
         }
         .padding(18)

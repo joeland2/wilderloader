@@ -111,3 +111,75 @@ func testReport() {
     assert(a.count == 1 && b.count == 1 && a[0] != b[0], "en mapp som saknas hoppas över, och inget skrivs över")
     assert((try? String(contentsOf: a[0], encoding: .utf8)) == html, "första rapporten ska vara orörd")
 }
+
+// MARK: MHL
+// En MHL-fil (version 1.1) i varje målmapp: varje fil med sökväg från mappen, storlek och xxHash-64.
+// Andra program, t.ex. Silverstack och ShotPut, kan kontrollera materialet mot den senare.
+
+struct MHLEntry {
+    /// Sökväg från målmappen.
+    let path: String
+    let size: Int64
+    let modified: Date
+    let hash: UInt64
+}
+
+func mhlXML(_ entries: [MHLEntry], start: Date, finish: Date, version: String) -> String {
+    let iso = ISO8601DateFormatter()
+    let rows = entries.map { e in
+        """
+          <hash>
+            <file>\(esc(e.path))</file>
+            <size>\(e.size)</size>
+            <lastmodificationdate>\(iso.string(from: e.modified))</lastmodificationdate>
+            <xxhash64be>\(hex(e.hash))</xxhash64be>
+            <hashdate>\(iso.string(from: finish))</hashdate>
+          </hash>
+        """
+    }.joined(separator: "\n")
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <hashlist version="1.1">
+      <creatorinfo>
+        <name>\(esc(NSFullUserName()))</name>
+        <username>\(esc(NSUserName()))</username>
+        <hostname>\(esc(Host.current().localizedName ?? ""))</hostname>
+        <tool>WilderLoader \(esc(version))</tool>
+        <startdate>\(iso.string(from: start))</startdate>
+        <finishdate>\(iso.string(from: finish))</finishdate>
+      </creatorinfo>
+    \(rows)
+    </hashlist>
+
+    """
+}
+
+/// Sparar MHL-filen i `folder`, med mappens namn och tiden i filnamnet. Skriver aldrig över.
+@discardableResult
+func writeMHL(_ xml: String, in folder: URL, date: Date) -> URL? {
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd_HHmmss"
+    var url = folder.appendingPathComponent("\(folder.lastPathComponent)_\(df.string(from: date)).mhl")
+    var n = 2
+    while FileManager.default.fileExists(atPath: url.path) {
+        url = folder.appendingPathComponent("\(folder.lastPathComponent)_\(df.string(from: date))_\(n).mhl"); n += 1
+    }
+    return (try? Data(xml.utf8).write(to: url, options: .withoutOverwriting)) != nil ? url : nil
+}
+
+func testMHL() {
+    let xml = mhlXML([MHLEntry(path: "Cam A/2026-10-14/A&B.MOV", size: 42, modified: Date(timeIntervalSince1970: 0), hash: 0xabc)],
+                     start: Date(), finish: Date(), version: "test")
+    assert(xml.contains("<file>Cam A/2026-10-14/A&amp;B.MOV</file>"), "sökvägen ska escapas")
+    assert(xml.contains("<xxhash64be>0000000000000abc</xxhash64be>") && xml.contains("<size>42</size>"), xml)
+    assert(xml.contains("<lastmodificationdate>1970-01-01T00:00:00Z</lastmodificationdate>"), "datum i ISO 8601")
+    let doc = try? XMLDocument(xmlString: xml)
+    assert(doc?.rootElement()?.name == "hashlist", "ska vara giltig XML")
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("wl-mhl-\(UUID().uuidString)")
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? fm.trashItem(at: dir, resultingItemURL: nil) }
+    let d = Date()
+    let a = writeMHL(xml, in: dir, date: d), b = writeMHL("x", in: dir, date: d)
+    assert(a != nil && b != nil && a != b && (try? String(contentsOf: a!, encoding: .utf8)) == xml, "ska inte skriva över")
+}

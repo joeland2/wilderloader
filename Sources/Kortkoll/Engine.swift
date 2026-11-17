@@ -605,6 +605,8 @@ func runSelfTest() {
     testScanPause()
     testHistory()
     testReport()
+    testResume()
+    testMHL()
     testCopyVerified()
     testFormatAndEject()
     let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(9 * 3600)
@@ -754,10 +756,45 @@ func copyVerified(_ src: URL, to dst: URL) throws {
 /// så att en disk som krånglar inte stoppar kopian till den andra.
 /// `progress`: antal byte som lästs från kortet, medan filen kopieras. `checked`: byte av kortets fil som kontrollerats efteråt.
 /// `hashed`: kortfilens xxHash-64 från kontrollen, till rapporten.
+/// En avbruten kopia fortsätter där den slutade. Blir resultatet inte identiskt görs den om från början, en gång.
 func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, checked: ((Int) -> Void)? = nil, hashed: ((UInt64) -> Void)? = nil) -> [Error?] {
+    let (first, resumed) = copyAttempt(src, to: dsts, resume: true, progress: progress, checked: checked, hashed: hashed)
+    guard resumed else { return first }
+    var out = first
+    let redo = dsts.indices.filter { first[$0] is NotIdentical }
+    guard !redo.isEmpty else { return out }
+    let again = copyAttempt(src, to: redo.map { dsts[$0] }, resume: false, progress: nil, checked: nil, hashed: hashed).0
+    for (k, i) in redo.enumerated() { out[i] = again[k] }
+    return out
+}
+
+/// Kopian blev inte lik kortet. Bara då kastas delen; vid andra fel ligger den kvar så att kopian kan fortsätta senare.
+struct NotIdentical: LocalizedError {
+    var errorDescription: String? { L("The copy did not come out identical", "Kopian blev inte identisk") }
+}
+
+/// Delar som en tidigare, avbruten kopia lämnade efter sig för `dst`, med storlek. Bara de som inte ändrats på en stund,
+/// så att en kopia som pågår från en annan dator lämnas i fred.
+func resumableParts(for dst: URL, maxSize: Int64, minAge: TimeInterval = 10) -> (url: URL, size: Int64)? {
+    let dir = dst.deletingLastPathComponent(), prefix = dst.lastPathComponent + "."
+    let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
+    let all = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys)) ?? []
+    return all.compactMap { u -> (URL, Int64)? in
+        let name = u.lastPathComponent
+        guard name.hasPrefix(prefix), name.hasSuffix(partSuffix), name.count == prefix.count + 8 + partSuffix.count,
+              let v = try? u.resourceValues(forKeys: Set(keys)), v.isRegularFile == true,
+              let size = v.fileSize.map(Int64.init), size > 0, size <= maxSize,
+              let date = v.contentModificationDate, Date().timeIntervalSince(date) >= minAge else { return nil }
+        return (u, size)
+    }.max { $0.1 < $1.1 }
+}
+
+private func copyAttempt(_ src: URL, to dsts: [URL], resume: Bool, progress: ((Int) -> Void)?, checked: ((Int) -> Void)?, hashed: ((UInt64) -> Void)?) -> ([Error?], Bool) {
     let fm = FileManager.default
     var results = [Error?](repeating: nil, count: dsts.count)
     var work: [(index: Int, part: URL)] = []
+    let srcSize = (try? src.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0 ?? 0) } ?? 0
+    var found: [Int: (url: URL, size: Int64)] = [:]
     for (i, dst) in dsts.enumerated() {
         do {
             try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -765,14 +802,26 @@ func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, 
                 if try !sameContent(src, dst) { throw CopyError(L("A different file with the same name is already there", "En annan fil med samma namn finns redan där")) }
                 continue
             }
+            if resume, let p = resumableParts(for: dst, maxSize: srcSize) {
+                found[i] = p
+                work.append((i, p.url))
+                continue
+            }
             // Filen får sitt riktiga namn först när den är kontrollerad, så en avbruten kopia ser aldrig ut som en färdig fil.
             // Filändelsen är inte media, så en kvarlämnad del räknas inte som en fil av appen.
-            work.append((i, dst.deletingLastPathComponent().appendingPathComponent("\(dst.lastPathComponent).\(UUID().uuidString.prefix(8)).wilderloader-part")))
+            work.append((i, dst.deletingLastPathComponent().appendingPathComponent("\(dst.lastPathComponent).\(UUID().uuidString.prefix(8))\(partSuffix)")))
         } catch { results[i] = error }
     }
-    guard !work.isEmpty else { return results }
+    guard !work.isEmpty else { return (results, false) }
+    // Alla platser läses från samma ställe i kortfilen, så det går bara att fortsätta om alla har en del; då från den kortaste.
+    let offset = work.allSatisfy({ found[$0.index] != nil }) ? work.map { found[$0.index]!.size }.min() ?? 0 : 0
+    if offset == 0 {
+        for (k, w) in work.enumerated() where found[w.index] != nil {
+            work[k].part = dsts[w.index].deletingLastPathComponent().appendingPathComponent("\(dsts[w.index].lastPathComponent).\(UUID().uuidString.prefix(8))\(partSuffix)")
+        }
+    }
 
-    let written = copyStreaming(src, to: work.map(\.part), progress: progress)
+    let written = copyStreaming(src, to: work.map(\.part), from: UInt64(offset), progress: progress)
     // Kortet och kopiorna läses samtidigt, eftersom de oftast ligger på olika enheter och väntar på varsin.
     let lock = NSLock()
     var hashes: [Int: Result<UInt64, Error>] = [:]
@@ -785,15 +834,16 @@ func copyVerified(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)? = nil, 
     for (k, w) in work.enumerated() {
         do {
             if let e = written[k] { throw e }
-            guard try hashes[k + 1]!.get() == hashes[0]!.get() else { throw CopyError(L("The copy did not come out identical", "Kopian blev inte identisk")) }
+            guard try hashes[k + 1]!.get() == hashes[0]!.get() else { throw NotIdentical() }
             try fm.moveItem(at: w.part, to: dsts[w.index])  // Misslyckas om filen hunnit dyka upp, så inget skrivs över.
         } catch {
-            // Går papperskorgen inte att nå (vanligt på NAS) blir delen kvar. Nästa skanning hittar den och erbjuder städning.
-            try? fm.trashItem(at: w.part, resultingItemURL: nil)
+            // En del som inte blev lik kortet kastas. Går papperskorgen inte att nå (vanligt på NAS) blir den kvar,
+            // och nästa skanning erbjuder städning. Vid andra fel ligger delen kvar så att kopian kan fortsätta.
+            if error is NotIdentical { try? fm.trashItem(at: w.part, resultingItemURL: nil) }
             results[w.index] = error
         }
     }
-    return results
+    return (results, offset > 0)
 }
 
 /// En kopia som skrivs: en liten kö, så att den långsammaste enheten sätter farten och inte summan av alla.
@@ -805,9 +855,12 @@ private final class CopyWriter {
     private var failure: Error?
     private let free = DispatchSemaphore(value: 4), ready = DispatchSemaphore(value: 0)
 
-    init(_ dst: URL) {
+    /// `offset` > 0: fortsätter en avbruten del från den punkten. Annars en ny fil.
+    init(_ dst: URL, offset: UInt64 = 0) {
         path = dst.path
-        let fd = open(dst.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)  // O_EXCL: skriver aldrig över.
+        // O_EXCL: en ny del skriver aldrig över något. En del som fortsätts är appens egen och kortas till rätt längd.
+        var fd = offset > 0 ? open(dst.path, O_WRONLY) : open(dst.path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+        if fd >= 0, offset > 0, ftruncate(fd, off_t(offset)) != 0 || lseek(fd, off_t(offset), SEEK_SET) < 0 { close(fd); fd = -1 }
         if fd >= 0 {
             // Utan cache måste kontrollen läsa kopian från disken, inte från Macens minne.
             _ = fcntl(fd, F_NOCACHE, 1)
@@ -838,8 +891,8 @@ private final class CopyWriter {
 }
 
 /// Läser källan en gång och skriver till alla kopior samtidigt. Skrivarna har egna trådar, så att de inte kan bli väntande på en ledig plats i en trådpool.
-private func copyStreaming(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)?) -> [Error?] {
-    let writers = dsts.map(CopyWriter.init)
+private func copyStreaming(_ src: URL, to dsts: [URL], from offset: UInt64 = 0, progress: ((Int) -> Void)?) -> [Error?] {
+    let writers = dsts.map { CopyWriter($0, offset: offset) }
     let group = DispatchGroup()
     for w in writers {
         group.enter()
@@ -852,6 +905,7 @@ private func copyStreaming(_ src: URL, to dsts: [URL], progress: ((Int) -> Void)
         let input = try FileHandle(forReadingFrom: src)
         defer { try? input.close() }
         _ = fcntl(input.fileDescriptor, F_NOCACHE, 1)
+        if offset > 0 { try input.seek(toOffset: offset); progress?(Int(offset)) }
         // Varje plats som tas i en kö lämnas tillbaka av skrivaren, och kön avslutas alltid med nil nedan.
         while writers.contains(where: { $0.error == nil }) {
             writers.forEach { $0.waitForRoom() }
@@ -1027,4 +1081,40 @@ func runCheck(_ path: String, full: Bool = false) {
         let away = (cands[f.url.lastPathComponent] ?? []).first { u in offline.contains { u.standardizedFileURL.path.hasPrefix($0) } }
         print(hit.map { "FINNS   \(f.rel) -> \($0.path)" } ?? away.map { "LISTA   \(f.rel) -> \($0.path) (urkopplad)" } ?? "SAKNAS  \(f.rel)")
     }
+}
+
+/// En avbruten kopia fortsätter där den slutade, och en del som inte stämmer görs om från början.
+func testResume() {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("wl-resume-\(UUID().uuidString)")
+    try! fm.createDirectory(at: root.appendingPathComponent("out"), withIntermediateDirectories: true)
+    defer { try? fm.trashItem(at: root, resultingItemURL: nil) }
+    let data = Data((0..<(3 << 20)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ $0 >> 9) })
+    let src = root.appendingPathComponent("A001.MOV")
+    try! data.write(to: src)
+    func part(_ dst: URL, _ content: Data) -> URL {
+        let u = dst.deletingLastPathComponent().appendingPathComponent("\(dst.lastPathComponent).abcdef12\(partSuffix)")
+        try! content.write(to: u)
+        try! fm.setAttributes([.modificationDate: Date().addingTimeInterval(-60)], ofItemAtPath: u.path)
+        return u
+    }
+    // Rätt början: fortsätter, och läser bara resten från kortet.
+    let a = root.appendingPathComponent("out/A001.MOV")
+    let pa = part(a, data.prefix(1 << 20))
+    let inode = { (u: URL) in (try? fm.attributesOfItem(atPath: u.path)[.systemFileNumber] as? Int) ?? -1 }
+    let before = inode(pa)
+    var read = 0
+    assert(copyVerified(src, to: [a], progress: { read += $0 })[0] == nil, "kopian ska fortsätta")
+    assert((try? Data(contentsOf: a)) == data && !fm.fileExists(atPath: pa.path), "kopian ska bli hel och delen bli filen")
+    assert(read == data.count, "förloppet ska räkna med det som redan fanns: \(read)")
+    assert(inode(a) == before, "kopian ska vara samma fil som delen, alltså fortsatt och inte omgjord")
+    // Fel början: görs om från början och blir ändå rätt.
+    let b = root.appendingPathComponent("out/B.MOV")
+    _ = part(b, Data(repeating: 7, count: 1 << 20))
+    assert(copyVerified(src, to: [b])[0] == nil && (try? Data(contentsOf: b)) == data, "en del som inte stämmer ska göras om")
+    // En del som nyss ändrats kan skrivas av en annan dator: rör den inte.
+    let c = root.appendingPathComponent("out/C.MOV")
+    let pc = part(c, data.prefix(1 << 20))
+    try! fm.setAttributes([.modificationDate: Date()], ofItemAtPath: pc.path)
+    assert(resumableParts(for: c, maxSize: Int64(data.count)) == nil, "en färsk del ska lämnas i fred")
 }
