@@ -48,6 +48,7 @@ struct KortkollApp: App {
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 940, minHeight: 500)
                 .onAppear { NSApp.activate() }
+                .task { await Updater.shared.check() }
         }
         .windowStyle(.hiddenTitleBar)
     }

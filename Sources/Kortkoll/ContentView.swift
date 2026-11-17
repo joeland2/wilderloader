@@ -140,6 +140,7 @@ struct ContentView: View {
     @AppStorage("saveMHL") private var saveMHL = false
     private var proOn: Bool { saveReport || showCardBar || saveMHL }
     @State private var cleaning = false
+    @ObservedObject private var updater = Updater.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -160,6 +161,7 @@ struct ContentView: View {
         .id(m.language)
         .sheet(isPresented: $asking) { CopyChooser(files: m.missing.map(\.file)).environmentObject(m) }
         .sheet(isPresented: $formatting) { FormatSheet().environmentObject(m) }
+        .sheet(isPresented: $updater.showSheet) { UpdateSheet(updater: updater, copying: m.copyingTo != nil) }
 
     }
 
@@ -181,6 +183,17 @@ struct ContentView: View {
                 } message: {
                     Text(m.leftovers.prefix(5).map(\.lastPathComponent).joined(separator: "\n"))
                 }
+            }
+            if let r = updater.available, !updater.showSheet {
+                Button { updater.showSheet = true } label: {
+                    Text(L("UPDATE \(r.version)", "UPPDATERA \(r.version)")).font(display(14)).tracking(1)
+                        .foregroundStyle(onOk)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 3).fill(accent))
+                }
+                .buttonStyle(.plain)
+                .help(L("A new version of WilderLoader is out", "En ny version av WilderLoader finns"))
+                .padding(.trailing, 10)
             }
             // Allt för proffs ligger här, så att huvudvyn förblir enkel.
             Button { pro.toggle() } label: {
@@ -2612,5 +2625,53 @@ struct CardQueue: View {
         .frame(width: 170, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 4).fill(cardFill))
         .overlay(RoundedRectangle(cornerRadius: 4).stroke(line.opacity(0.7)))
+    }
+}
+
+/// Visas när en ny version finns: vad som är nytt, och Uppdatera eller Senare.
+struct UpdateSheet: View {
+    @ObservedObject var updater: Updater
+    var copying = false
+
+    var body: some View {
+        let r = updater.available
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                Image(systemName: "arrow.down.circle.fill").font(.system(size: 30)).foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L("WilderLoader \(r?.version ?? "") is out", "WilderLoader \(r?.version ?? "") är här")).font(display(26)).tracking(0.8)
+                    Text(L("You have \(appVersion). Here's what's new.", "Du har \(appVersion). Det här är nytt.")).font(.system(size: 12)).foregroundStyle(mute)
+                }
+            }
+            ScrollView {
+                Text((try? AttributedString(markdown: r?.notes ?? "", options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(r?.notes ?? ""))
+                    .font(.system(size: 13)).lineSpacing(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .frame(minHeight: 120, maxHeight: 300)
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 4).fill(panel))
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(panelLine))
+            if let e = updater.error {
+                Text(e).font(.system(size: 12)).foregroundStyle(miss).fixedSize(horizontal: false, vertical: true)
+            } else if copying {
+                Text(L("You can update when the copy is done.", "Du kan uppdatera när kopieringen är klar.")).font(.system(size: 12)).foregroundStyle(mute)
+            }
+            HStack {
+                Button(L("Later", "Senare")) { updater.later() }.keyboardShortcut(.cancelAction)
+                Spacer()
+                if updater.installing { ProgressView().controlSize(.small).padding(.trailing, 6) }
+                Button(updater.installing ? L("Updating…", "Uppdaterar…") : L("Update and restart", "Uppdatera och starta om")) {
+                    Task { await updater.install() }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(copying || updater.installing)
+            }
+        }
+        .padding(24)
+        .frame(width: 480)
+        .foregroundStyle(fg)
+        .background(bg)
     }
 }

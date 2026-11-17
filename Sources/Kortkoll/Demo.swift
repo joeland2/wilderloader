@@ -158,6 +158,11 @@ enum Demo {
         m.bytesTotal = 0
         m.thumbs = []
         shot.save(main, "safe", settle: 1)
+        // Ny version: liten knapp i headern, och rutan med vad som är nytt.
+        Updater.shared.available = Release(tag: "v0.4-beta", notes: "- Copies pick up where they stopped if a cable comes loose.\n- **MHL files** with every copy, under PRO.\n- Runs on Intel Macs too.", zip: URL(string: "https://example.com/a.zip")!, page: URL(string: "https://example.com")!)
+        shot.save(main, "update-button", settle: 0.5)
+        shot.sheet(AnyView(UpdateSheet(updater: Updater.shared).preferredColorScheme(.dark)), "sheet-update")
+        Updater.shared.available = nil
 
         shot.sheet(AnyView(FormatSheet().environmentObject(m).preferredColorScheme(.dark)), "sheet-format")
         shot.sheet(AnyView(ProPanel().environmentObject(m).background(Color(white: 0.16)).environment(\.colorScheme, .dark)), "sheet-pro")
